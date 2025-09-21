@@ -1,286 +1,139 @@
-/*
 #include <SPI.h>
 #include <LoRa.h>
-#include <TinyGPS++.h>
+#include <TinyGPSPlus.h>
 
-// =============================
-// Configuración GPS y LoRa
-// =============================
-#define GPS_RX 16     // ESP32 RX2 <- TX GPS
-#define GPS_TX 17     // ESP32 TX2 -> RX GPS (usualmente no se usa)
-#define LORA_CS 5
-#define LORA_RST 14
-#define LORA_IRQ 27
-#define LORA_BAND 433E6
-
-HardwareSerial SerialGPS(2);
+// ==============================
+// Configuración GPS (Serial2)
+// ==============================
+#define GPS_RX 16
+#define GPS_TX 17
 TinyGPSPlus gps;
 
-// =============================
-// Variables de filtrado
-// =============================
+// ==============================
+// Configuración LoRa
+// ==============================
+#define LORA_SS    18
+#define LORA_RST   14
+#define LORA_DIO0  26
+#define LORA_BAND  433E6
 
-// Ventana para filtro de mediana
-double lat_window[3] = {0, 0, 0};
-double lon_window[3] = {0, 0, 0};
-double alt_window[3] = {0, 0, 0};
-int win_idx = 0;
-
-// EMA (suavizado exponencial)
-double lat_f = 0, lon_f = 0, alt_f = 0;
-bool have_filter = false;
-const double ALPHA = 0.35;   // 0.1 = muy suave, 0.5 = rápido
-
-// =============================
-// Funciones de filtrado
-// =============================
-double median3(double a, double b, double c) {
-  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
-  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
-  return c;
-}
-
-void filterGPS(double lat, double lon, double alt,
-               double &lat_out, double &lon_out, double &alt_out) {
-  // Guardar en ventana circular
-  lat_window[win_idx] = lat;
-  lon_window[win_idx] = lon;
-  alt_window[win_idx] = alt;
-  win_idx = (win_idx + 1) % 3;
-
-  // Calcular medianas
-  double lat_m = median3(lat_window[0], lat_window[1], lat_window[2]);
-  double lon_m = median3(lon_window[0], lon_window[1], lon_window[2]);
-  double alt_m = median3(alt_window[0], alt_window[1], alt_window[2]);
-
-  // EMA
-  if (!have_filter) {
-    lat_f = lat_m;
-    lon_f = lon_m;
-    alt_f = alt_m;
-    have_filter = true;
-  } else {
-    lat_f = ALPHA * lat_m + (1.0 - ALPHA) * lat_f;
-    lon_f = ALPHA * lon_m + (1.0 - ALPHA) * lon_f;
-    alt_f = ALPHA * alt_m + (1.0 - ALPHA) * alt_f;
-  }
-
-  lat_out = lat_f;
-  lon_out = lon_f;
-  alt_out = alt_f;
-}
-
-// =============================
-// Setup
-// =============================
-void setup() {
-  Serial.begin(115200);
-  SerialGPS.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
-
-  Serial.println("Inicializando LoRa...");
-  LoRa.setPins(LORA_CS, LORA_RST, LORA_IRQ);
-  if (!LoRa.begin(LORA_BAND)) {
-    Serial.println("Fallo al iniciar LoRa!");
-    while (1);
-  }
-  LoRa.setSpreadingFactor(10);       // robusto
-  LoRa.setSignalBandwidth(125E3);    // 125 kHz
-  LoRa.setCodingRate4(5);            // 4/5
-  LoRa.enableCrc();                  // CRC activado
-  LoRa.setTxPower(17);               // potencia (máx 20)
-  LoRa.setSyncWord(0x12);            // igual que receptor
-
-  Serial.println("LoRa OK.");
-}
-
-// =============================
-// Loop principal
-// =============================
-void loop() {
-  while (SerialGPS.available() > 0) {
-    gps.encode(SerialGPS.read());
-
-    if (gps.location.isUpdated()) {
-      double lat_raw = gps.location.lat();
-      double lon_raw = gps.location.lng();
-      double alt_raw = gps.altitude.meters();
-      double speed_raw = gps.speed.kmph();
-      double heading_raw = gps.course.deg();
-
-      // Aplicar filtro
-      double lat, lon, alt;
-      filterGPS(lat_raw, lon_raw, alt_raw, lat, lon, alt);
-
-      // Formato JSON (Ground Station espera GS#...)
-      String msg = "GS#{";
-      msg += "\"lat\":" + String(lat, 6);      // 6 decimales (precisión ~10 cm)
-      msg += ",\"lon\":" + String(lon, 6);
-      msg += ",\"alt\":" + String(alt, 1);
-      msg += ",\"speed\":" + String(speed_raw, 2);
-      msg += ",\"heading\":" + String(heading_raw, 1);
-      msg += ",\"battery\":0.0";               // Placeholder batería
-      msg += "}";
-
-      // Enviar por LoRa
-      LoRa.beginPacket();
-      LoRa.print(msg);
-      LoRa.endPacket();
-
-      // Enviar también por Serial (debug)
-      Serial.println(msg);
-    }
-  }
-}
-*/
-#include <SPI.h>
-#include <LoRa.h>
-#include <TinyGPS++.h>
-
-// =================== Pines LoRa ===================
-#define LORA_SS   5
-#define LORA_RST  14
-#define LORA_DIO0 2
-#define LORA_BAND 433E6
-
-// =================== Pines GPS ===================
-#define GPS_RX 16   // GPS TX → ESP32 RX2
-#define GPS_TX 17   // GPS RX → ESP32 TX2
-
-TinyGPSPlus gps;
-
-// =================== Variables ===================
+// ==============================
+// Variables
+// ==============================
 unsigned long lastSend = 0;
-int seq = 0;
+const unsigned long sendInterval = 1000; // ms
+double lastLat = 0.0, lastLon = 0.0, lastAlt = 0.0;
+double lastSpeed = 0.0, lastHeading = 0.0;
+float batteryLevel = 100.0;
 
-// =============================
-// Variables de filtrado
-// =============================
+#define MAX_BUFFER 10
+String telemetryBuffer[MAX_BUFFER];
+int bufferStart = 0, bufferEnd = 0;
 
-// Ventana para filtro de mediana
-double lat_window[3] = {0, 0, 0};
-double lon_window[3] = {0, 0, 0};
-double alt_window[3] = {0, 0, 0};
-int win_idx = 0;
-
-// EMA (suavizado exponencial)
-double lat_f = 0, lon_f = 0, alt_f = 0;
-bool have_filter = false;
-const double ALPHA = 0.35;   // 0.1 = muy suave, 0.5 = rápido
-
-// =============================
-// Funciones de filtrado
-// =============================
-double median3(double a, double b, double c) {
-  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
-  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
-  return c;
-}
-
-void filterGPS(double lat, double lon, double alt,
-               double &lat_out, double &lon_out, double &alt_out) {
-  // Guardar en ventana circular
-  lat_window[win_idx] = lat;
-  lon_window[win_idx] = lon;
-  alt_window[win_idx] = alt;
-  win_idx = (win_idx + 1) % 3;
-
-  // Calcular medianas
-  double lat_m = median3(lat_window[0], lat_window[1], lat_window[2]);
-  double lon_m = median3(lon_window[0], lon_window[1], lon_window[2]);
-  double alt_m = median3(alt_window[0], alt_window[1], alt_window[2]);
-
-  // EMA
-  if (!have_filter) {
-    lat_f = lat_m;
-    lon_f = lon_m;
-    alt_f = alt_m;
-    have_filter = true;
-  } else {
-    lat_f = ALPHA * lat_m + (1.0 - ALPHA) * lat_f;
-    lon_f = ALPHA * lon_m + (1.0 - ALPHA) * lon_f;
-    alt_f = ALPHA * alt_m + (1.0 - ALPHA) * alt_f;
-  }
-
-  lat_out = lat_f;
-  lon_out = lon_f;
-  alt_out = alt_f;
-}
-
-
-
-// =================== Setup ===================
+// ==============================
+// Setup
+// ==============================
 void setup() {
   Serial.begin(115200);
+  while (!Serial);
+
+  // Configurar GPS
   Serial2.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
 
-  // --- LoRa ---
+  // Inicializar LoRa
+  SPI.begin(5, 19, 26, LORA_SS);
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(LORA_BAND)) {
-    Serial.println("LoRa init failed!");
+    Serial.println("Error inicializando LoRa");
     while (1);
   }
-  LoRa.setSpreadingFactor(10);       // robusto
-  LoRa.setSignalBandwidth(125E3);    // 125 kHz
-  LoRa.setCodingRate4(5);            // 4/5
-  LoRa.enableCrc();                  // CRC activado
-  LoRa.setTxPower(17);               // potencia (máx 20)
-  LoRa.setSyncWord(0x12);            // igual que receptor
-
-  Serial.println("LoRa OK, esperando GPS...");
+  Serial.println("✅ LoRa inicializado");
 }
 
-// =================== Loop ===================
+// ==============================
+// Loop principal
+// ==============================
 void loop() {
-  // Procesar datos entrantes del GPS
+  readGPS();
+  handleTelemetry();
+  simulateBattery();
+}
+
+// ==============================
+// Funciones GPS
+// ==============================
+void readGPS() {
   while (Serial2.available() > 0) {
     gps.encode(Serial2.read());
   }
 
-  unsigned long now = millis();
-  if (now - lastSend > 1000) {   // enviar cada 1s
-    lastSend = now;
-    sendTelemetry();
+  if (gps.location.isValid()) {
+    lastLat = gps.location.lat();
+    lastLon = gps.location.lng();
+    lastAlt = gps.altitude.meters();
+    lastSpeed = gps.speed.kmph();
+    lastHeading = gps.course.deg();
   }
 }
 
-// =================== Función de envío ===================
-void sendTelemetry() {
-  if (gps.location.isValid() && gps.altitude.isValid() && gps.speed.isValid()) {
+// ==============================
+// Funciones Telemetría
+// ==============================
+void handleTelemetry() {
+  if (millis() - lastSend >= sendInterval) {
+    lastSend = millis();
 
+    if (!gps.location.isValid()) {
+      Serial.println("⚠️ GPS no válido, esperando señal...");
+      return;
+    }
 
-    double lat_raw = gps.location.lat();
-    double lon_raw = gps.location.lng();
-    double alt_raw = gps.altitude.meters();
-    double speed_raw = gps.speed.kmph();
-    double heading_raw = gps.course.deg();
+    String payload = String("{\"lat\":") + String(lastLat, 6) +
+                     ",\"lon\":" + String(lastLon, 6) +
+                     ",\"alt\":" + String(lastAlt, 1) +
+                     ",\"speed\":" + String(lastSpeed, 2) +
+                     ",\"heading\":" + String(lastHeading, 1) +
+                     ",\"battery\":" + String(batteryLevel, 1) +
+                     "}";
 
-      // Aplicar filtro
-    double lat, lon, alt;
-    filterGPS(lat_raw, lon_raw, alt_raw, lat, lon, alt);
+    String message = "GS#" + payload + "#END";
 
-    /*float lat = gps.location.lat();
-    float lon = gps.location.lng();
-    float alt = gps.altitude.meters();
-    float speed = gps.speed.kmph();
-    float heading = gps.course.deg();*/
+    // Guardar en buffer
+    bufferTelemetry(message);
 
-    // Construir mensaje JSON con envoltura GS# ... #END
-    String msg = "GS#{\"seq\":" + String(seq++) +
-                 ",\"lat\":" + String(lat, 6) +
-                 ",\"lon\":" + String(lon, 6) +
-                 ",\"alt\":" + String(alt, 1) +
-                 ",\"speed\":" + String(speed_raw, 2) +
-                 ",\"heading\":" + String(heading_raw, 1) +
-                 ",\"battery\":0.0}#END";
+    // Enviar buffer
+    sendBuffer();
+  }
+}
 
-    // Enviar por LoRa
+void bufferTelemetry(String message) {
+  telemetryBuffer[bufferEnd] = message;
+  bufferEnd = (bufferEnd + 1) % MAX_BUFFER;
+  if (bufferEnd == bufferStart) { // buffer lleno
+    bufferStart = (bufferStart + 1) % MAX_BUFFER;
+  }
+}
+
+void sendBuffer() {
+  while (bufferStart != bufferEnd) {
+    String msg = telemetryBuffer[bufferStart];
+    bufferStart = (bufferStart + 1) % MAX_BUFFER;
+
+    // Serial debug
+    Serial.println(msg);
+
+    // LoRa
     LoRa.beginPacket();
     LoRa.print(msg);
     LoRa.endPacket();
-
-    // Debug por Serial
-    Serial.println(msg);
-  } else {
-    Serial.println("Esperando fix GPS...");
+    LoRa.idle();
   }
+}
+
+// ==============================
+// Simulación de batería
+// ==============================
+void simulateBattery() {
+  batteryLevel -= 0.01;
+  if (batteryLevel < 0) batteryLevel = 100.0;
 }
