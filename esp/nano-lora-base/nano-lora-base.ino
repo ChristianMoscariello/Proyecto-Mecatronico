@@ -1,74 +1,49 @@
 #include <SPI.h>
 #include <LoRa.h>
-#include <ArduinoJson.h>
 
-// Pines LoRa (ajusta si usás otros)
-#define LORA_SS   5
-#define LORA_RST  14
-#define LORA_DIO0 2
-#define LORA_BAND 433E6   // frecuencia SX1278
-
-unsigned long lastPacketMillis = 0;
+// Pines LoRa - ESP32
+#define LORA_SS   5    // NSS / CS
+#define LORA_RST  14   // Reset
+#define LORA_DIO0 2    // DIO0
+#define LORA_BAND 433E6  // Frecuencia en Hz
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   while (!Serial);
 
-  pinMode(LORA_RST, OUTPUT);
-  digitalWrite(LORA_RST, HIGH);
+  Serial.println("{\"status\":\"Iniciando Receptor LoRa\"}");
+
+  // Configuración de pines SPI y LoRa
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
 
   if (!LoRa.begin(LORA_BAND)) {
-    Serial.println("❌ Error iniciando LoRa");
-    while (1);
+    Serial.println("{\"error\":\"Fallo inicialización LoRa\"}");
+    while (true) {
+      delay(1000);  // No avanza hasta que se corrija
+    }
   }
 
-  Serial.println("📡 Receptor LoRa ESP32 listo en 433 MHz");
+  Serial.println("{\"status\":\"LoRa inicializado correctamente\"}");
 }
 
 void loop() {
-  int packetSize = LoRa.parsePacket();
+  int packetSize = LoRa.parsePacket();  
+
   if (packetSize) {
-    String incoming = "";
+    String payload = "";
+
     while (LoRa.available()) {
-      incoming += (char)LoRa.read();
+      payload += (char)LoRa.read();
     }
 
-    int startIdx = incoming.indexOf("GS#");
-    int endIdx   = incoming.indexOf("#END");
+    int rssi = LoRa.packetRssi();
+    float snr = LoRa.packetSnr();
 
-    if (startIdx != -1 && endIdx != -1 && endIdx > startIdx) {
-      String jsonStr = incoming.substring(startIdx + 3, endIdx);
-
-      StaticJsonDocument<256> doc;
-      DeserializationError error = deserializeJson(doc, jsonStr);
-
-      if (!error) {
-        // Reenvío directo a la PC (para Python)
-        Serial.print("GS#");
-        serializeJson(doc, Serial);
-        Serial.println("#END");
-
-        // Debug adicional en el monitor serie
-        Serial.print("RSSI: "); Serial.print(LoRa.packetRssi());
-        Serial.print(" dBm | SNR: "); Serial.println(LoRa.packetSnr(), 2);
-
-        lastPacketMillis = millis();
-      } else {
-        Serial.println("❌ Error decodificando JSON");
-      }
-    } else {
-      Serial.print("RAW inválido: "); Serial.println(incoming);
-    }
+    // Envia JSON por Serial USB
+    
+    Serial.println(payload);
+    
   }
 
-  // Watchdog LoRa (si pasan 30s sin paquetes, resetea módulo)
-  if (millis() - lastPacketMillis > 30000) {
-    Serial.println("⚠️ Watchdog: reiniciando LoRa...");
-    digitalWrite(LORA_RST, LOW);
-    delay(100);
-    digitalWrite(LORA_RST, HIGH);
-    delay(100);
-    LoRa.begin(LORA_BAND);
-    lastPacketMillis = millis();
-  }
+  delay(1);  
 }
