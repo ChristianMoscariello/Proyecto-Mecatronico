@@ -237,7 +237,9 @@ void sendWithAck(const String &jsonPayload,const String &id){
   String full=jsonPayload;
   if(!jsonPayload.startsWith("UAV#")) full="UAV#"+jsonPayload;
   if(!full.endsWith("#END")) full+="#END";
-  LoRa.beginPacket();LoRa.print(full);LoRa.endPacket();
+  LoRa.beginPacket();
+  LoRa.print(full);
+  LoRa.endPacket();
   Serial.println("📤 [sendWithAck] "+full);
   for(int i=0;i<MAX_PENDING;i++){
     if(!pendingMsgs[i].waitingAck){
@@ -356,13 +358,19 @@ void sendTelemetry(double lat,double lon,double alt,double speed,double heading,
   StaticJsonDocument<256> doc;
   doc["t"]="TELEMETRY";
   JsonObject d=doc.createNestedObject("d");
-  d["lat"]=lat;d["lon"]=lon;d["alt"]=alt;
-  d["speed"]=speed;d["heading"]=heading;
-  d["battery"]=0;d["status"]=0;
+  d["lat"]=lat;
+  d["lon"]=lon;
+  d["alt"]=alt;
+  d["speed"]=speed;
+  d["heading"]=heading;
+  d["battery"]=0;
+  d["status"]=0;
   doc["ts"]=ts;
   String p;serializeJson(doc,p);
   String msg=String(UAV_HDR)+p+String(SFX);
-  LoRa.beginPacket();LoRa.print(msg);LoRa.endPacket();
+  LoRa.beginPacket();
+  LoRa.print(msg);
+  LoRa.endPacket();
   Serial.println("📤 [sendTelemetry] "+msg);
 }
 
@@ -370,10 +378,16 @@ void sendTrims(){
   StaticJsonDocument<256> doc;
   doc["t"]="TRIM_DATA";
   JsonObject d=doc.createNestedObject("d");
-  d["accel"]=trims.accel;d["roll_lr"]=trims.roll_lr;d["roll_fb"]=trims.roll_fb;
-  d["rudder"]=trims.rudder;d["switch"]=trims.sw;
-  String id=generateMsgID();doc["id"]=id;doc["ts"]=millis();
-  String p;serializeJson(doc,p);
+  d["accel"]=trims.accel;
+  d["roll_lr"]=trims.roll_lr;
+  d["roll_fb"]=trims.roll_fb;
+  d["rudder"]=trims.rudder;
+  d["switch"]=trims.sw;
+  String id=generateMsgID();
+  doc["id"]=id;
+  doc["ts"]=millis();
+  String p;
+  serializeJson(doc,p);
   sendWithAck(p,id);
 }
 
@@ -415,12 +429,22 @@ void sendEventToGS(const String &topic, double lat, double lon, double alt, unsi
 // 📥 PROCESAMIENTO DE MENSAJES LoRa ENTRANTES
 // ============================================================================
 bool extractNextFrame(String& buf,String& jsonOut,const char* wantedHdr){
-  int h=buf.indexOf(wantedHdr);int hU=buf.indexOf(UAV_HDR);
-  if(hU>=0&&(hU<h||h<0)){int endU=buf.indexOf(SFX,hU);if(endU<0)return false;buf.remove(0,endU+strlen(SFX));return false;}
+  int h=buf.indexOf(wantedHdr);
+  int hU=buf.indexOf(UAV_HDR);
+  if(hU>=0&&(hU<h||h<0)){
+    int endU=buf.indexOf(SFX,hU);
+    if(endU<0)return false;
+    buf.remove(0,endU+strlen(SFX));
+    return false;}
   if(h<0){if(buf.length()>2048)buf.remove(0,buf.length()-256);return false;}
-  int lbrace=buf.indexOf('{',h);if(lbrace<0)return false;
-  int end=buf.indexOf(SFX,lbrace);if(end<0)return false;
-  jsonOut=buf.substring(lbrace,end);buf.remove(0,end+strlen(SFX));jsonOut.trim();return true;
+  int lbrace=buf.indexOf('{',h);
+  if(lbrace<0)return false;
+  int end=buf.indexOf(SFX,lbrace);
+  if(end<0)return false;
+  jsonOut=buf.substring(lbrace,end);
+  buf.remove(0,end+strlen(SFX));
+  jsonOut.trim();
+  return true;
 }
 
 void processIncomingJSON(const String &jsonIn, bool fromGS) {
@@ -525,7 +549,7 @@ void handleTelemetry(){
 void handleSerialRPI() {
   // Verificar si hay bytes disponibles
   while (SerialRPI.available()) {
-    String jsonIn = SerialRPI.readStringUntil('}');  // lee hasta fin de JSON
+    String jsonIn = SerialRPI.readStringUntil('\n');  // lee hasta fin de JSON
     jsonIn.trim();
 
     // --- Depuración serial ---
