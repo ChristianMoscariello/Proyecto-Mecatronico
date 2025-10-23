@@ -75,6 +75,25 @@ void saveTrims() {
 }
 
 // ============================================================================
+// ⚙️ CONFIGURACIÓN DE MISION
+// ============================================================================
+struct Coordinate {
+  double lat;
+  double lon;
+};
+
+struct MissionData {
+  Coordinate home;
+  float altitude;
+  float spacing;
+  String event_action;
+  std::vector<Coordinate> polygon;
+  bool loaded = false; 
+};
+
+MissionData mission;
+
+// ============================================================================
 // 🔹 FUNCIONES DE UTILIDAD
 // ============================================================================
 unsigned long toUnixTime(int y,int m,int d,int h,int min,int s){
@@ -489,15 +508,57 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       return;
     }
 
-    if (strcmp(type, "MISSION_COMPACT") == 0) {
-      Serial.println("📦 Misión recibida");
-      sendAckToGS(msgId);
-      return;
+    else if (strcmp(t, "MISSION_COMPACT") == 0) {
+      Serial.println("📦 Recibido MISSION_COMPACT");
+
+      JsonObject d = doc["d"];   // 👈 ESTA LÍNEA CREA 'd'
+      if (d.isNull()) {
+        Serial.println("❌ Error: campo 'd' ausente en MISSION_COMPACT");
+        return;
+      }
+
+      // Limpiar misión anterior
+      mission.polygon.clear();
+
+      // Cargar coordenadas del polígono
+      JsonArray p = d["p"];
+      if (!p.isNull()) {
+        for (JsonArray coord : p) {
+          if (coord.size() == 2) {
+            Coordinate pt;
+            pt.lat = coord[0];
+            pt.lon = coord[1];
+            mission.polygon.push_back(pt);
+          }
+        }
+      }
+
+      // Cargar HOME
+      JsonArray h = d["h"];
+      if (!h.isNull() && h.size() == 2) {
+        mission.home.lat = h[0];
+        mission.home.lon = h[1];
+      }
+
+      // Cargar otros parámetros
+      mission.altitude = d["a"] | 20.0;
+      mission.spacing = d["s"] | 10.0;
+      mission.event_action = String((const char*)d["event_action"] | "NONE");
+      mission.loaded = true;
+
+      // Debug
+      Serial.println("✅ Misión parseada correctamente:");
+      Serial.printf("   HOME:     %.6f, %.6f\n", mission.home.lat, mission.home.lon);
+      Serial.printf("   Altitud:  %.1f m\n", mission.altitude);
+      Serial.printf("   Spacing:  %.1f m\n", mission.spacing);
+      Serial.printf("   Acción:   %s\n", mission.event_action.c_str());
+      Serial.printf("   Waypoints: %d\n", mission.polygon.size());
+
+      // Enviar ACK
+      sendAckToGS(doc["id"].as<String>());
     }
 
-    sendAckToGS(msgId);
-    return;
-  }
+   }
 
   // ==========================================================
   // 🔹 2. Mensajes internos del dron (desde RPi / simulador)
