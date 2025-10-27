@@ -23,12 +23,11 @@ Preferences gpsPrefs;
 #define LORA_IRQ 27
 #define LORA_BAND 433E6
 // ===== Framing =====
-static const char* GS_HDR  = "GS#";    // Mensajes que vienen de la BASE
-static const char* UAV_HDR = "UAV#";   // Mensajes que enviamos a la BASE
+static const char* GS_HDR  = "GS#";    
+static const char* UAV_HDR = "UAV#";   
 static const char* SFX     = "#END";
-String loraRxBuf;// Buffer de recepción LoRa
-// Extrae el próximo JSON delimitado por header/sufijo.
-// Si encuentra frames con header equivocado (p.ej. "UAV#") los descarta.
+String loraRxBuf;
+
 bool extractNextFrame(String& buf, String& jsonOut, const char* wantedHdr) {
   // 1) Buscar el próximo header válido (queremos GS# en el dron)
   int h = buf.indexOf(wantedHdr);

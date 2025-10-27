@@ -9,6 +9,8 @@
 #include <ArduinoJson.h>
 #include <Adafruit_BMP280.h>
 #include <Preferences.h>
+#include <math.h>
+#include <vector>
 
 // ============================================================================
 // 🛰️ CONFIGURACIÓN DE HARDWARE
@@ -41,6 +43,23 @@ String loraRxBuf;
 #define RPI_RX  32
 #define RPI_TX  33
 HardwareSerial SerialRPI(1);
+
+// ============================================================
+// ESTRUCTURAS BÁSICAS
+// ============================================================
+struct Coordinate {
+  double lat;
+  double lon;
+};
+
+struct Mission {
+  bool loaded = false;
+  std::vector<Coordinate> polygon;
+  Coordinate home;
+  double altitude = 0;
+  double spacing  = 0;
+  String event_action;
+} mission;
 
 // ============================================================================
 // ⚙️ CONFIGURACIÓN DE TRIMS (guardado en flash)
@@ -102,6 +121,29 @@ unsigned long toUnixTime(int y,int m,int d,int h,int min,int s){
   long days=(long)(365.25*(y+4716))+(long)(30.6001*(m+1))+d+b-1524.5;
   unsigned long ts=(days-2440588)*86400UL + h*3600UL + min*60UL + s;
   return ts;
+}
+
+double deg2rad(double deg) { return deg * M_PI / 180.0; }
+double rad2deg(double rad) { return rad * 180.0 / M_PI; }
+
+// Distancia en metros entre dos coordenadas GPS
+double haversineDistance(double lat1, double lon1, double lat2, double lon2) {
+  double R = 6371000.0; // radio de la Tierra [m]
+  double dLat = deg2rad(lat2 - lat1);
+  double dLon = deg2rad(lon2 - lon1);
+  double a = sin(dLat/2)*sin(dLat/2) +
+             cos(deg2rad(lat1))*cos(deg2rad(lat2))*sin(dLon/2)*sin(dLon/2);
+  double c = 2 * atan2(sqrt(a), sqrt(1-a));
+  return R * c;
+}
+
+// Rumbo desde A hacia B en grados (0=Norte)
+double computeBearing(double lat1, double lon1, double lat2, double lon2) {
+  double y = sin(deg2rad(lon2 - lon1)) * cos(deg2rad(lat2));
+  double x = cos(deg2rad(lat1))*sin(deg2rad(lat2)) -
+             sin(deg2rad(lat1))*cos(deg2rad(lat2))*cos(deg2rad(lon2 - lon1));
+  double brng = atan2(y, x);
+  return fmod((rad2deg(brng) + 360.0), 360.0);
 }
 
 // ============================================================================
@@ -467,7 +509,7 @@ bool extractNextFrame(String& buf,String& jsonOut,const char* wantedHdr){
 }
 
 void processIncomingJSON(const String &jsonIn, bool fromGS) {
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<1024> doc;
   if (deserializeJson(doc, jsonIn)) {
     Serial.println("❌ JSON inválido");
     return;
@@ -508,6 +550,7 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       return;
     }
 
+<<<<<<< HEAD
     else if (strcmp(t, "MISSION_COMPACT") == 0) {
       Serial.println("📦 Recibido MISSION_COMPACT");
 
@@ -559,6 +602,67 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
     }
 
    }
+=======
+    if (strcmp(type, "MISSION_COMPACT") == 0) {
+      Serial.println("📦 Recibido MISSION_COMPACT");
+
+      JsonObject d = doc["d"];
+      if (d.isNull()) {
+        Serial.println("❌ Error: campo 'd' ausente en MISSION_COMPACT");
+        return;
+      }
+
+      // Limpiar misión anterior
+      mission.polygon.clear();
+
+      // Cargar coordenadas del polígono
+      JsonArray p = d["p"];
+      if (!p.isNull()) {
+        Serial.println("📍 Coordenadas del polígono:");
+        for (JsonArray::iterator it = p.begin(); it != p.end(); ++it) {
+          JsonArray coord = (*it).as<JsonArray>();
+          if (coord.size() == 2) {
+            Coordinate pt;
+            pt.lat = coord[0];
+            pt.lon = coord[1];
+            mission.polygon.push_back(pt);
+            Serial.printf("   Punto: %.6f, %.6f\n", pt.lat, pt.lon);
+          } else {
+            Serial.println("⚠ Coordenada inválida (no tiene 2 valores)");
+          }
+        }  // ✅ cierre del for
+      }    // ✅ cierre del if (!p.isNull())
+
+      // Cargar HOME
+      JsonArray h = d["h"];
+      if (!h.isNull() && h.size() == 2) {
+        mission.home.lat = h[0];
+        mission.home.lon = h[1];
+      }
+
+      // Cargar otros parámetros
+      mission.altitude = d["a"] | 20.0;
+      mission.spacing  = d["s"] | 10.0;
+
+      if (d.containsKey("event_action"))
+        mission.event_action = (const char*)d["event_action"];
+      else
+        mission.event_action = "NONE";
+
+      mission.loaded = true;
+
+      // Debug
+      Serial.printf("   HOME:     %.6f, %.6f\n", mission.home.lat, mission.home.lon);
+      Serial.printf("   Altitud:  %.1f m\n", mission.altitude);
+      Serial.printf("   Spacing:  %.1f m\n", mission.spacing);
+      Serial.printf("   Acción:   %s\n", mission.event_action.c_str());
+      Serial.printf("   Waypoints: %d\n", mission.polygon.size());
+
+      sendAckToGS(doc["id"].as<String>());
+      return;
+    }  // ✅ cierre del bloque MISSION_COMPACT
+  }    // ✅ cierre del bloque fromGS
+>>>>>>> e64acf0d2a666b92065987e49209423d789a24b7
 
   // ==========================================================
   // 🔹 2. Mensajes internos del dron (desde RPi / simulador)
@@ -572,14 +676,12 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
                       gps.time.hour(), gps.time.minute(), gps.time.second());
     }
 
-    // Enviar evento completo (GPS, altitud, timestamp) a la Ground Station
     sendEventToGS(type, lat_f, lon_f, alt_f, ts);
     return;
   }
 
   Serial.printf("⚠️ [RPI] Evento desconocido: %s\n", type);
 }
-
 // ============================================================================
 // 🔄 MANEJO DE SENSORES Y COMUNICACIONES
 // ============================================================================
@@ -636,6 +738,69 @@ void handleLoRa(){
   while(extractNextFrame(loraRxBuf,js,GS_HDR)){processIncomingJSON(js,true);}
 }
 
+// ======================================================
+// Simulación de vuelo interpolado entre dos coordenadas
+// ======================================================
+
+// ============================================================
+// 🧭 Simulación de vuelo simple con estabilización de cámaras
+// ============================================================
+void simulateFlight(const Coordinate& start,
+                    const Coordinate& end,
+                    double altitude,
+                    int steps,
+                    unsigned long stepTime) {
+  double totalDist = haversineDistance(start.lat, start.lon, end.lat, end.lon);
+  Serial.printf("✈️ Simulando vuelo de %.1f m en %d pasos...\n", totalDist, steps);
+
+  double dLat = (end.lat - start.lat) / steps;
+  double dLon = (end.lon - start.lon) / steps;
+
+  double accumulated = 0.0;
+  double lastLat = start.lat;
+  double lastLon = start.lon;
+
+  for (int i = 0; i <= steps; i++) {
+    double lat = start.lat + i * dLat;
+    double lon = start.lon + i * dLon;
+
+    double stepDist = haversineDistance(lastLat, lastLon, lat, lon);
+    accumulated += stepDist;
+    lastLat = lat;
+    lastLon = lon;
+
+    unsigned long ts = millis();
+    sendTelemetry(lat, lon, altitude, 5.0, 0.0, ts);
+
+    Serial.printf("   📡 Paso %2d → %.6f, %.6f  (dist=%.2f m, total=%.2f m)\n",
+                  i, lat, lon, stepDist, accumulated);
+
+    // 📷 Cada 5 metros, estabilizar cámaras y enviar mensaje al RPi
+    if (accumulated >= 5.0) {
+      Serial.println("📷 Estabilizando cámaras...");
+
+      // Crear JSON para enviar al RPi
+      StaticJsonDocument<128> stableMsg;
+      stableMsg["t"] = "STABLE";
+      stableMsg["lat"] = lat;
+      stableMsg["lon"] = lon;
+      stableMsg["ts"] = millis();
+
+      String jsonStr;
+      serializeJson(stableMsg, jsonStr);
+      SerialRPI.println(jsonStr);
+
+      Serial.println("📤 Enviado a RPi: " + jsonStr);
+
+      delay(3500);  // tiempo de estabilización
+      accumulated = 0.0;
+    }
+
+    delay(stepTime);
+  }
+
+  Serial.println("🛬 Fin de simulación, destino alcanzado.");
+}
 // ============================================================================
 // 🚀 SETUP Y LOOP PRINCIPALES
 // ============================================================================
@@ -670,4 +835,9 @@ void loop(){
   handleSerialRPI();
   handleLoRa();
   checkPendingAcks();
+  if (mission.loaded && mission.polygon.size() >= 1) {
+    simulateFlight(mission.home, mission.polygon[0], mission.altitude, 30, 300);
+    simulateFlight(mission.polygon[0], mission.home,  mission.altitude, 30, 300);
+  
+  }
 }
