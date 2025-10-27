@@ -711,7 +711,6 @@ void simulateFlight(const Coordinate& start,
       stableMsg["t"] = "STABLE";
       stableMsg["lat"] = lat;
       stableMsg["lon"] = lon;
-      stableMsg["alt"] = altitude;
       stableMsg["ts"] = millis();
 
       String jsonStr;
@@ -720,7 +719,7 @@ void simulateFlight(const Coordinate& start,
 
       Serial.println("📤 Enviado a RPi: " + jsonStr);
 
-      delay(1500);  // tiempo de estabilización
+      delay(3500);  // tiempo de estabilización
       accumulated = 0.0;
     }
 
