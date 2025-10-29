@@ -5,6 +5,7 @@
 #include <Adafruit_BMP280.h>
 #include <Preferences.h>
 
+
 // =============================
 // Configuración GPS 
 // =============================
@@ -21,25 +22,53 @@ Preferences gpsPrefs;
 #define LORA_RST 14
 #define LORA_IRQ 27
 #define LORA_BAND 433E6
+// ===== Framing =====
+static const char* GS_HDR  = "GS#";    
+static const char* UAV_HDR = "UAV#";   
+static const char* SFX     = "#END";
+String loraRxBuf;
 
-// =============================
-// Protocolo de comunicación
-// =============================
-const char* HEADER = "GS#";
-const char* FOOTER = "#END";
+bool extractNextFrame(String& buf, String& jsonOut, const char* wantedHdr) {
+  // 1) Buscar el próximo header válido (queremos GS# en el dron)
+  int h = buf.indexOf(wantedHdr);
+  int hU = buf.indexOf(UAV_HDR);
+  // Si aparece un frame propio (UAV#) antes, lo descartamos para evitar eco
+  if (hU >= 0 && (hU < h || h < 0)) {
+    int endU = buf.indexOf(SFX, hU);
+    if (endU < 0) return false; // esperar más datos
+    // descartar el frame propio (eco)
+    buf.remove(0, endU + strlen(SFX));
+    return false;
+  }
+  if (h < 0) {
+    // No hay header válido; evita crecimiento infinito del buffer
+    if (buf.length() > 2048) buf.remove(0, buf.length() - 256);
+    return false;
+  }
+  // 2) Buscar el JSON y el footer
+  int lbrace = buf.indexOf('{', h);
+  if (lbrace < 0) return false;
+  int end = buf.indexOf(SFX, lbrace);
+  if (end < 0) return false;
+  jsonOut = buf.substring(lbrace, end);
+  buf.remove(0, end + strlen(SFX));
+  jsonOut.trim();
+  return true;
+}
 
 // =============================
 // Configuración Raspberry
 // =============================
 #define RPI_RX  4     
 #define RPI_TX  2     
-HardwareSerial SerialRPI(1);
+HardwareSerial SerialRPI(1);    // UART1 para Raspberry
 
 // =============================
 // Configuración BMP280
 // =============================
 Adafruit_BMP280 bmp;    
-bool bmp_ok = false;
+bool bmp_ok = false;    
+float alt_bmp = 0.0;
 
 // =============================
 // Trims
@@ -53,6 +82,7 @@ struct TrimValues {
   float rudder  = 128.0;
   float sw      = 128.0;
 } trims;
+
 
 void loadTrims(){
   prefs.begin("drone",true);
@@ -83,7 +113,8 @@ double lat_f = 0, lon_f = 0, alt_f = 0;
 bool have_filter = false;
 const double ALPHA = 0.35;
 
-unsigned long lastTelemetryTime = 0;
+// Control de intervalo de telemetría
+unsigned long lastTelemetryTime = 0;    
 
 // =============================
 // Filtrado GPS
@@ -108,24 +139,30 @@ void filterGPS(double lat, double lon, double alt, double &lat_out, double &lon_
 // =============================
 // Hotstart GPS
 // =============================
+// Guardar la última posición y hora
 void saveGPSBackup() {
   if (gps.location.isValid() && gps.date.isValid() && gps.time.isValid()) {
     gpsPrefs.begin("gps", false);
     gpsPrefs.putDouble("lat", gps.location.lat());
     gpsPrefs.putDouble("lon", gps.location.lng());
-    gpsPrefs.putULong("date", gps.date.value());
-    gpsPrefs.putULong("time", gps.time.value());
+    gpsPrefs.putULong("date", gps.date.value());   // YYYYMMDD
+    gpsPrefs.putULong("time", gps.time.value());   // HHMMSS
     gpsPrefs.end();
   }
 }
 
+// Recuperar la posición estimada
 void loadGPSBackup() {
   gpsPrefs.begin("gps", true);
   double lat = gpsPrefs.getDouble("lat", 0.0);
   double lon = gpsPrefs.getDouble("lon", 0.0);
+  unsigned long date = gpsPrefs.getULong("date", 0);
+  unsigned long time = gpsPrefs.getULong("time", 0);
   gpsPrefs.end();
+
   if (lat != 0.0 && lon != 0.0) {
-    Serial.printf("Restaurando posicion: lat %.6f, lon %.6f\n", lat, lon);
+    Serial.printf("Restaurando posición estimada: lat %.6f, lon %.6f\n", lat, lon);
+    // Aquí se podría enviar comandos UBX específicos si se quisiera AID-HOT START
   }
 }
 
@@ -148,36 +185,39 @@ struct PendingMsg {
   unsigned long lastSend;
   int retries;
   bool waitingAck;
-  String msgID;
+  String msgID;                
 };
 
 #define MAX_PENDING 5
 PendingMsg pendingMsgs[MAX_PENDING];
-unsigned long ackTimeout = 1500;
-int maxRetries = 3;
-unsigned long nextMsgCounter = 0;
+unsigned long ackTimeout = 1500;   // 1 s
+int maxRetries = 4;
+unsigned long nextMsgCounter = 0;  
 
+// ✅ Generar ID como string
 String generateMsgID() {
   nextMsgCounter++;
   return String(nextMsgCounter);
 }
 
-// Construir mensaje con formato HEADER+JSON+FOOTER
-String buildMessage(const String &jsonPayload) {
-  return String(HEADER) + jsonPayload + String(FOOTER);
-}
-
+// ✅ Enviar con ACK y almacenar en la cola
 void sendWithAck(const String &jsonPayload, const String &id) {
-  String msg = buildMessage(jsonPayload);
-  
-  LoRa.beginPacket();
-  LoRa.print(msg);
-  LoRa.endPacket();
-  Serial.println("TX ACK: " + msg);
+  String fullMsg = jsonPayload;
 
+  // Asegurar header y footer
+  if (!jsonPayload.startsWith("UAV#")) fullMsg = "UAV#" + jsonPayload;
+  if (!fullMsg.endsWith("#END")) fullMsg += "#END";
+
+  LoRa.beginPacket();
+  LoRa.print(fullMsg);
+  LoRa.endPacket();
+
+  Serial.println("📤 Enviado con ACK: " + fullMsg);
+
+  // Registrar en cola de pendientes
   for (int i = 0; i < MAX_PENDING; i++) {
     if (!pendingMsgs[i].waitingAck) {
-      pendingMsgs[i].payload = msg;
+      pendingMsgs[i].payload = fullMsg;
       pendingMsgs[i].lastSend = millis();
       pendingMsgs[i].retries = maxRetries;
       pendingMsgs[i].waitingAck = true;
@@ -185,21 +225,26 @@ void sendWithAck(const String &jsonPayload, const String &id) {
       return;
     }
   }
-  Serial.println("Cola llena");
+  Serial.println("⚠️ Cola de pendientes llena");
 }
 
+
+// ✅ Buscar el ACK correspondiente
 void handleAck(const String &ackID) {
   for (int i = 0; i < MAX_PENDING; i++) {
     if (pendingMsgs[i].waitingAck && pendingMsgs[i].msgID == ackID) {
-      Serial.println("ACK OK id:" + ackID);
+      Serial.println("✅ ACK recibido para ID=" + ackID);
       pendingMsgs[i].waitingAck = false;
       pendingMsgs[i].payload = "";
       pendingMsgs[i].msgID = "";
-      break;
+      return;
     }
   }
+  Serial.println("ℹ️ ACK recibido pero no se encontró el ID=" + ackID);
 }
 
+
+// ✅ Reenvío si no se recibe ACK
 void checkPendingAcks() {
   unsigned long now = millis();
   for (int i = 0; i < MAX_PENDING; i++) {
@@ -211,38 +256,49 @@ void checkPendingAcks() {
           LoRa.endPacket();
           pendingMsgs[i].lastSend = now;
           pendingMsgs[i].retries--;
-          Serial.println("RETRY: " + pendingMsgs[i].msgID);
+          Serial.println("🔁 Reenvío: " + pendingMsgs[i].payload);
         } else {
-          Serial.println("TIMEOUT: " + pendingMsgs[i].msgID);
+          Serial.println("❌ Sin ACK, descartando: " + pendingMsgs[i].payload);
           pendingMsgs[i].waitingAck = false;
+          pendingMsgs[i].payload = "";
+          pendingMsgs[i].msgID = "";
         }
       }
     }
   }
 }
 
+
+// ✅ Enviar ACK de respuesta a la GS
 void sendAckToGS(const String &originalID) {
-  if (originalID == "") return;
-  
+  if (originalID == "") {
+    Serial.println("⚠️ ACK sin ID, no enviado");
+    return;
+  }
+
   StaticJsonDocument<128> doc;
   doc["t"] = "ACK";
-  doc["id"] = originalID;
+  JsonObject d = doc.createNestedObject("d");
+  d["id"] = originalID;
   doc["ts"] = millis();
 
   String payload;
   serializeJson(doc, payload);
-  String msg = buildMessage(payload);
 
+  String msg = String(UAV_HDR) + payload + String(SFX);
   LoRa.beginPacket();
   LoRa.print(msg);
   LoRa.endPacket();
 
-  Serial.println("TX ACK: " + msg);
+  Serial.println("📤 ACK enviado → GS (id=" + originalID + ")");
 }
+
 
 // =============================
 // Envíos LoRa
 // =============================
+
+// Telemetría (no requiere ACK para no saturar)
 void sendTelemetry(double lat, double lon, double alt,
                    double speed, double heading, unsigned long ts) {
   StaticJsonDocument<256> doc;
@@ -255,39 +311,41 @@ void sendTelemetry(double lat, double lon, double alt,
 
   String payload;
   serializeJson(doc, payload);
-  String msg = buildMessage(payload);
+  String msg = String(UAV_HDR) + payload + String(SFX);
 
   LoRa.beginPacket();
   LoRa.print(msg);
   LoRa.endPacket();
+  //Serial.println("📤 " + msg);
 }
 
+// Enviar trims (requiere ACK)
 void sendTrims() {
   StaticJsonDocument<256> doc;
   doc["t"] = "TRIM_DATA";
   JsonObject d = doc.createNestedObject("d");
-  d["accel"] = trims.accel; 
-  d["roll_lr"] = trims.roll_lr;
-  d["roll_fb"] = trims.roll_fb; 
-  d["rudder"] = trims.rudder;
+  d["accel"] = trims.accel; d["roll_lr"] = trims.roll_lr;
+  d["roll_fb"] = trims.roll_fb; d["rudder"] = trims.rudder;
   d["switch"] = trims.sw;
 
-  String msgID = generateMsgID();
+  String msgID = generateMsgID();       // ✅ ID único
   doc["id"] = msgID;
   doc["ts"] = millis();
 
   String payload;
   serializeJson(doc, payload);
   sendWithAck(payload, msgID);
+  Serial.println(payload);
 }
 
+// Enviar eventos desde RPI (requieren ACK)
 void sendEventToGS(const String &topic, double lat, double lon, double alt, unsigned long ts) {
   StaticJsonDocument<256> doc;
   doc["t"] = topic;
   JsonObject d = doc.createNestedObject("d");
   d["lat"] = lat; d["lon"] = lon; d["alt"] = alt;
 
-  String msgID = generateMsgID();
+  String msgID = generateMsgID();       // ✅ ID único
   doc["id"] = msgID;
   doc["ts"] = ts;
 
@@ -302,74 +360,115 @@ void sendEventToGS(const String &topic, double lat, double lon, double alt, unsi
 void processIncomingJSON(const String &jsonIn, bool fromGS) {
   StaticJsonDocument<512> doc;
   DeserializationError err = deserializeJson(doc, jsonIn);
+
   if (err) {
-    Serial.println("JSON error");
+    Serial.println("❌ Error JSON entrante");
     return;
   }
 
-  const char* t = doc["t"];
-  if (!t) return;
+  const char* type = doc["t"] | "";
+  const char* msgId = doc["id"] | "";
 
+  Serial.print("📥 JSON recibido: ");
+  Serial.println(jsonIn);
+
+  // ==========================================
+  // 🔹 1. Mensajes desde la Ground Station
+  // ==========================================
   if (fromGS) {
-    if (strcmp(t, "ACK") == 0) {
-      String ackID = doc["id"] | "";
-      if (ackID != "") handleAck(ackID);
+    // --- a) Si es un ACK, limpiar pendiente ---
+    if (strcmp(type, "ACK") == 0) {
+      String ackID = "";
+
+      // Buscar ID dentro de "d" o al nivel raíz
+      if (doc.containsKey("d")) {
+        ackID = doc["d"]["id"] | "";
+      } else if (doc.containsKey("id")) {
+        ackID = doc["id"] | "";
+      }
+
+      if (ackID != "") {
+        handleAck(ackID);
+      } else {
+        Serial.println("⚠️ ACK recibido sin ID válido");
+      }
       return;
     }
 
-    String msgID = doc["id"].as<String>();
-    
-    if (strcmp(t, "GET_TRIMS") == 0) {
-      sendTrims();
-      sendAckToGS(msgID);
-    }
-    else if (strcmp(t, "TRIM") == 0) {
-      JsonObject d = doc["d"];
-      if (!d.isNull()) {
-        trims.accel   = d["accel"]   | trims.accel;
-        trims.roll_lr = d["roll_lr"] | trims.roll_lr;
-        trims.roll_fb = d["roll_fb"] | trims.roll_fb;
-        trims.rudder  = d["rudder"]  | trims.rudder;
-        trims.sw      = d["switch"]  | trims.sw;
-        saveTrims();
-        sendAckToGS(msgID);
+    // --- b) GET_TRIMS: responder con datos ---
+    if (strcmp(type, "GET_TRIMS") == 0) {
+      StaticJsonDocument<256> trimDoc;
+      trimDoc["t"] = "TRIM_DATA";
+      JsonObject d = trimDoc.createNestedObject("d");
+      d["accel"] = 128;
+      d["roll_lr"] = 130;
+      d["roll_fb"] = 120;
+      d["rudder"] = 125;
+      d["switch"] = 128;
+      trimDoc["id"] = String(random(1000, 9999));
+      trimDoc["ts"] = millis();
+
+      String payload;
+      serializeJson(trimDoc, payload);
+
+      String fullMsg = "UAV#" + payload + "#END";
+      LoRa.beginPacket();
+      LoRa.print(fullMsg);
+      LoRa.endPacket();
+
+      Serial.println("📤 Enviado TRIM_DATA → GS");
+
+      // Enviar ACK para confirmar recepción del comando
+      if (msgId && strlen(msgId) > 0) {
+        sendAckToGS(msgId);
       }
-    }
-    else if (strcmp(t, "ARM") == 0) { 
-      Serial.println("CMD: ARM"); 
-      sendAckToGS(msgID); 
-    }
-    else if (strcmp(t, "DISARM") == 0) { 
-      Serial.println("CMD: DISARM"); 
-      sendAckToGS(msgID); 
-    }
-    else if (strcmp(t, "RETURN") == 0) { 
-      Serial.println("CMD: RETURN"); 
-      sendAckToGS(msgID); 
-    }
-    else if (strcmp(t, "MISSION_COMPACT") == 0) { 
-      Serial.println("CMD: MISSION"); 
-      sendAckToGS(msgID); 
-    }
-    else if (strcmp(t, "GRIPPER") == 0) { 
-      Serial.println("CMD: GRIPPER"); 
-      sendAckToGS(msgID); 
+      return;
     }
 
+    // --- c) Otros comandos típicos ---
+    if (strcmp(type, "ARM") == 0) {
+      Serial.println("🚁 Recibido comando ARM");
+      sendAckToGS(msgId);
+      return;
+    }
+
+    if (strcmp(type, "DISARM") == 0) {
+      Serial.println("🛑 Recibido comando DISARM");
+      sendAckToGS(msgId);
+      return;
+    }
+
+    if (strcmp(type, "MISSION_COMPACT") == 0) {
+      Serial.println("📦 Recibido misión compacta");
+      sendAckToGS(msgId);
+      return;
+    }
+
+    // --- d) Comando desconocido ---
+    Serial.print("❔ Comando desconocido: ");
+    Serial.println(type);
+    sendAckToGS(msgId);
     return;
   }
 
-  // Mensajes desde RPI
-  if (strcmp(t, "FIRE") == 0 || strcmp(t, "PERSON") == 0) {
+  // ==========================================
+  // 🔹 2. Mensajes internos del dron (desde RPi o sensores)
+  // ==========================================
+  if (strcmp(type, "FIRE") == 0 || strcmp(type, "PERSON") == 0) {
     unsigned long ts = 0;
-    if (gps.date.isValid() && gps.time.isValid())
+    if (gps.date.isValid() && gps.time.isValid()) {
       ts = toUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
                       gps.time.hour(), gps.time.minute(), gps.time.second());
-    sendEventToGS(t, lat_f, lon_f, alt_f, ts);
-    String msgID = generateMsgID();
-    sendAckToGS(msgID);
+    }
+    sendEventToGS(type, lat_f, lon_f, alt_f, ts);
+  } else {
+    Serial.println("Evento desconocido desde RPi: " + String(type));
   }
 }
+
+
+
+
 
 // =============================
 // Setup
@@ -377,26 +476,26 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
 void setup(){
   Serial.begin(115200);
   SerialGPS.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
-  SerialRPI.begin(115200, SERIAL_8N1, RPI_RX, RPI_TX);
+  SerialRPI.begin(115200,RPI_RX,RPI_TX);
 
-  loadGPSBackup();
+  loadGPSBackup();  // Restaurar backup al encender
   
   LoRa.setPins(LORA_CS,LORA_RST,LORA_IRQ);
   if(!LoRa.begin(LORA_BAND)){
-    Serial.println("LoRa FAIL");
+    Serial.println("{\"error\":\"Fallo inicialización LoRa\"}");
     while(true) delay(1000);
   }
-  Serial.println("LoRa OK");
+  Serial.println("{\"status\":\"LoRa inicializado correctamente\"}");
 
   if(bmp.begin(0x76)){
-    bmp_ok=true;
-    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,Adafruit_BMP280::SAMPLING_X2,
-                    Adafruit_BMP280::SAMPLING_X16,Adafruit_BMP280::FILTER_X16,
-                    Adafruit_BMP280::STANDBY_MS_63);
+    bmp_ok=true; bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,Adafruit_BMP280::SAMPLING_X2,
+                                  Adafruit_BMP280::SAMPLING_X16,Adafruit_BMP280::FILTER_X16,
+                                  Adafruit_BMP280::STANDBY_MS_63);
     Serial.println("BMP280 OK");
-  }
+  } else Serial.println("No se detectó BMP280");
 
   loadTrims();
+  delay(1500);
 }
 
 // =============================
@@ -404,26 +503,31 @@ void setup(){
 // =============================
 void loop(){
   updateGPS();
-  handleTelemetry();
-  handleSerialRPI();
-  handleLoRa();
-  checkPendingAcks();
+  handleTelemetry(); //Envia telemetria cada 1 segundo
+  handleSerialRPI(); //Manejo mensajes desde raspberry
+  handleLoRa(); //Maneho mensajes desde gs por lora
+  checkPendingAcks(); //check ack sin responder
+ 
 }
+
 
 // =============================
 // FUNCIONES
 // =============================
+
 void updateGPS() {
   while (SerialGPS.available() > 0) {
     gps.encode(SerialGPS.read());
     if (gps.location.isUpdated()) {
-      saveGPSBackup();
+      saveGPSBackup(); // Guardar continuamente mientras hay fix
     }
   }
+  
 }
 
 void handleTelemetry() {
   if (millis() - lastTelemetryTime >= 1000) {
+    
     if (gps.location.isValid()) {
       double lat_raw = gps.location.lat();
       double lon_raw = gps.location.lng();
@@ -445,38 +549,21 @@ void handleTelemetry() {
 }
 
 void handleSerialRPI() {
-  static String buffer = "";
   while (SerialRPI.available()) {
-    char c = SerialRPI.read();
-    if (c == '\n') {
-      processIncomingJSON(buffer, false);
-      buffer = "";
-    } else {
-      buffer += c;
-    }
+    String jsonIn = SerialRPI.readStringUntil('\n');
+    processIncomingJSON(jsonIn, false);
   }
 }
 
 void handleLoRa() {
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
-    String rawMsg = "";
-    while (LoRa.available()) {
-      rawMsg += (char)LoRa.read();
-    }
-    
-    Serial.println("RX: " + rawMsg);
-    
-    // Buscar header y footer
-    int headerPos = rawMsg.indexOf(HEADER);
-    int footerPos = rawMsg.indexOf(FOOTER);
-    
-    if (headerPos >= 0 && footerPos > headerPos) {
-      int startPos = headerPos + strlen(HEADER);
-      String jsonPayload = rawMsg.substring(startPos, footerPos);
-      processIncomingJSON(jsonPayload, true);
-    } else {
-      Serial.println("Formato invalido");
-    }
+    while (LoRa.available()) loraRxBuf += (char)LoRa.read();
+  }
+  // Extraer todos los frames completos que vengan de la BASE (GS# ... #END)
+  String js;
+  while (extractNextFrame(loraRxBuf, js, GS_HDR)) {
+    processIncomingJSON(js, true);
   }
 }
+
