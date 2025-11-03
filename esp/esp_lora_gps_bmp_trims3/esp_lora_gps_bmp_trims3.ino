@@ -316,7 +316,7 @@ void sendTelemetry(double lat, double lon, double alt,
   LoRa.beginPacket();
   LoRa.print(msg);
   LoRa.endPacket();
-  //Serial.println("📤 " + msg);
+  Serial.println("📤 [sendTelemetry] "+msg);
 }
 
 // Enviar trims (requiere ACK)
