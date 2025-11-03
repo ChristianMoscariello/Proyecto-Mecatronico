@@ -4,11 +4,13 @@
 // =============================
 // CONFIGURACIÓN HARDWARE
 // =============================
-#define FIRE_BTN   12     // Pulsador FIRE → masa
-#define PERSON_BTN 13     // Pulsador PERSON → masa
-#define UART_TX    17     // TX hacia el dron (RPI_TX en el dron)
-#define UART_RX    16     // RX desde el dron
-#define LED_PIN     2     // LED interno del ESP32 DevKitV1
+#define FIRE_BTN     12     // 🔥 Pulsador FIRE → masa
+#define PERSON_BTN   13     // 🧍 Pulsador PERSON → masa
+#define GO_BTN       14     // ▶️ Pulsador GO → masa
+#define UART_TX      17     // TX hacia el dron (RPI_TX en el dron)
+#define UART_RX      16     // RX desde el dron
+#define LED_PIN       2     // LED interno del ESP32 DevKitV1
+
 HardwareSerial SerialToDrone(2);
 
 // =============================
@@ -16,10 +18,13 @@ HardwareSerial SerialToDrone(2);
 // =============================
 unsigned long lastDebounceFire = 0;
 unsigned long lastDebouncePerson = 0;
+unsigned long lastDebounceGo = 0;
+
 bool lastFireState = HIGH;
 bool lastPersonState = HIGH;
-const unsigned long debounceDelay = 50;
+bool lastGoState = HIGH;
 
+const unsigned long debounceDelay = 50;
 unsigned long nextMsgCounter = 0;
 String rxBuffer = "";
 
@@ -27,35 +32,36 @@ String rxBuffer = "";
 // FUNCIONES AUXILIARES
 // =============================
 
-// Parpadeo LED (3 veces)
-void blinkLedStable() {
-  for (int i = 0; i < 3; i++) {
+// 🔸 Función genérica de parpadeo LED
+void blinkLedPattern(int blinks, int onTime = 150, int offTime = 150) {
+  for (int i = 0; i < blinks; i++) {
     digitalWrite(LED_PIN, HIGH);
-    delay(200);
+    delay(onTime);
     digitalWrite(LED_PIN, LOW);
-    delay(200);
+    delay(offTime);
   }
 }
 
-// Generar un ID incremental simple
+// 🔸 Generar un ID incremental simple
 String generateMsgID() {
   nextMsgCounter++;
   return String(nextMsgCounter);
 }
 
-// Envía un evento con solo "t" e "id"
-void sendEvent(const char* type) {
+// 🔸 Enviar mensaje de análisis (fire, person o go)
+void sendAnalysisResult(const char* result) {
   StaticJsonDocument<128> doc;
-  doc["t"] = type;
+  doc["t"] = result;  // "fire", "person" o "go"
+  doc["ts"] = millis();
+
   String payload;
   serializeJson(doc, payload);
 
-  SerialToDrone.print(payload);
-  //SerialToDrone.print('\n'); 
+  SerialToDrone.println(payload);
   Serial.println("📤 Enviado → Dron (UART2): " + payload);
 }
 
-// Procesar JSON recibido desde el dron
+// 🔸 Procesar JSON recibido desde el dron
 void processIncomingJSON(const String& jsonIn) {
   StaticJsonDocument<256> doc;
   DeserializationError err = deserializeJson(doc, jsonIn);
@@ -66,28 +72,21 @@ void processIncomingJSON(const String& jsonIn) {
   }
 
   const char* type = doc["t"] | "";
-  JsonObject d = doc["d"];
+  double lat = doc["lat"] | 0.0;
+  double lon = doc["lon"] | 0.0;
   unsigned long ts = doc["ts"] | 0;
 
   if (strcmp(type, "STABLE") == 0) {
-    double lat = d["lat"] | 0.0;
-    double lon = d["lon"] | 0.0;
-    double alt = d["alt"] | 0.0;
-
     Serial.println("📷 [STABLE] recibido del dron:");
-    Serial.printf("   ↳ Lat: %.6f | Lon: %.6f | Alt: %.2f m | ts: %lu\n", lat, lon, alt, ts);
-    blinkLedStable();
- 
-  } 
-
-
-  else {
+    Serial.printf("   ↳ Lat: %.6f | Lon: %.6f | ts: %lu\n", lat, lon, ts);
+    blinkLedPattern(3, 200, 200); // tres parpadeos normales
+  } else {
     Serial.print("ℹ️ Tipo desconocido: ");
     Serial.println(type);
   }
 }
 
-// Leer mensajes entrantes desde el dron
+// 🔸 Leer mensajes entrantes desde el dron
 void handleSerialInput() {
   while (SerialToDrone.available()) {
     char c = SerialToDrone.read();
@@ -102,7 +101,6 @@ void handleSerialInput() {
   }
 }
 
-
 // =============================
 // SETUP
 // =============================
@@ -112,10 +110,13 @@ void setup() {
 
   pinMode(FIRE_BTN, INPUT_PULLUP);
   pinMode(PERSON_BTN, INPUT_PULLUP);
+  pinMode(GO_BTN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
 
   Serial.println("🚀 Simulador de RPi listo. Pulsa:");
   Serial.println("   🔥 GPIO12 → FIRE");
   Serial.println("   🧍 GPIO13 → PERSON");
+  Serial.println("   ▶️ GPIO14 → GO");
 }
 
 // =============================
@@ -124,25 +125,36 @@ void setup() {
 void loop() {
   bool fireState = digitalRead(FIRE_BTN);
   bool personState = digitalRead(PERSON_BTN);
+  bool goState = digitalRead(GO_BTN);
 
-  handleSerialInput(); 
+  handleSerialInput();
 
   // FIRE pulsado
   if (fireState == LOW && lastFireState == HIGH && (millis() - lastDebounceFire) > debounceDelay) {
     lastDebounceFire = millis();
     Serial.println("🔥 FIRE activado");
-    sendEvent("FIRE");
-    delay(1000);
+    sendAnalysisResult("FIRE");
+    blinkLedPattern(3, 100, 100); // 3 parpadeos rápidos
   }
 
   // PERSON pulsado
   if (personState == LOW && lastPersonState == HIGH && (millis() - lastDebouncePerson) > debounceDelay) {
     lastDebouncePerson = millis();
     Serial.println("🧍 PERSON activado");
-    sendEvent("PERSON");
-    delay(1000);
+    sendAnalysisResult("PERSON");
+    blinkLedPattern(2, 250, 250); // 2 parpadeos lentos
+  }
+
+  // GO pulsado
+  if (goState == LOW && lastGoState == HIGH && (millis() - lastDebounceGo) > debounceDelay) {
+    lastDebounceGo = millis();
+    Serial.println("▶️ GO activado");
+    sendAnalysisResult("GO");
+    blinkLedPattern(1, 400, 150); // 1 parpadeo largo
   }
 
   lastFireState = fireState;
   lastPersonState = personState;
+  lastGoState = goState;
 }
+

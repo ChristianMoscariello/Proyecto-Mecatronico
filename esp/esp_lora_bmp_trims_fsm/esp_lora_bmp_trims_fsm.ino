@@ -61,6 +61,47 @@ struct Mission {
   String event_action;
 } mission;
 
+// ============================================================
+// 🧭 Máquina de estados del dron
+// ============================================================
+
+enum DroneState {
+  IDLE,            // Esperando misión
+  TAKEOFF,         // Ascendiendo hasta altitud deseada
+  NAVIGATE,        // Avanzando a waypoint
+  STABILIZE,       // Estabilizando cámaras y enviando STABLE
+  WAIT_ANALYSIS,   // Esperando respuesta del RPi
+  RETURN_HOME,     // Retorno al punto HOME
+  LAND,            // Descendiendo
+  COMPLETE         // Misión finalizada
+};
+
+DroneState state = IDLE;
+unsigned long stateEntryTime = 0;
+
+// Resultado de análisis de la RPi
+enum AnalysisResult { NONE, GO, FIRE, PERSON };
+AnalysisResult analysisResult = NONE;
+
+// Misión y recorrido
+int currentWaypoint = 0;
+std::vector<Coordinate> pathPoints;
+
+// Timeout de análisis (5 s)
+const unsigned long ANALYSIS_TIMEOUT = 5000;
+// Timeout de análisis (90 s)
+const unsigned long ANALYSIS_TIMEOUT = 90000;
+unsigned long analysisStartTime = 0;
+
+// Interrupciones por LoRa
+bool loraReturnCommand = false;
+bool loraDisarmCommand = false;
+
+// Para telemetría / misión
+unsigned long missionStartTime = 0;
+// --- SIMULACIÓN ---
+bool simulationMode = false;
+
 // ============================================================================
 // ⚙️ CONFIGURACIÓN DE TRIMS (guardado en flash)
 // ============================================================================
@@ -93,9 +134,8 @@ void saveTrims() {
   prefs.end();
 }
 
-
 // ============================================================================
-// 🔹 FUNCIONES DE UTILIDAD
+// 🔹 FUNCIONES DE UTILIDAD y geodesicas
 // ============================================================================
 unsigned long toUnixTime(int y,int m,int d,int h,int min,int s){
   if(m<=2){y-=1; m+=12;}
@@ -513,27 +553,68 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       return;
     }
 
-    if (strcmp(type, "GET_TRIMS") == 0) {
+    else if (strcmp(type, "GET_TRIMS") == 0) {
       sendTrims();
       sendAckToGS(msgId);
       return;
     }
 
-    if (strcmp(type, "ARM") == 0) {
+    else if (strcmp(type, "TRIM") == 0) {
+      JsonObject d = doc["d"];
+      if (!d.isNull()) {
+        trims.accel   = d["accelerator"] | trims.accel;  // <- si tu GS usa "accelerator"
+        trims.roll_lr = d["roll_lr"]     | trims.roll_lr;
+        trims.roll_fb = d["roll_fb"]     | trims.roll_fb;
+        trims.rudder  = d["rudder"]      | trims.rudder;
+        trims.sw      = d["switch"]      | trims.sw;     // ← clave correcta: "switch"
+        saveTrims();
+        sendAckToGS(msgId);
+      }
+      return;
+    }
+
+    else if (strcmp(type, "GRIPPER") == 0) {
+      Serial.println("🦾 GRIPPER recibido (placeholder)");
+      sendAckToGS(msgId);
+      return;
+    }
+
+    else if (strcmp(type, "ARM") == 0) {
       Serial.println("🚁 ARM recibido");
       if (bmp_ok) { calibrateAltZero(60, 20); }
       sendAckToGS(msgId);
       return;
     }
 
-    if (strcmp(type, "DISARM") == 0) {
-      Serial.println("🛑 DISARM recibido");
+    else if (strcmp(type, "DISARM") == 0) {
+      Serial.println("🛰️ [LoRa] DISARM recibido → bandera activada");
+      loraDisarmCommand = true;
+      sendAckToGS(msgId);
+      return;
+    }
+    else if (strcmp(type, "RETURN") == 0) {
+      Serial.println("🛰️ [LoRa] RETURN recibido → bandera activada");
+      loraReturnCommand = true;
       sendAckToGS(msgId);
       return;
     }
 
-    
-    if (strcmp(type, "MISSION_COMPACT") == 0) {
+    else if (strcmp(type, "SIM_ON") == 0) {
+      simulationMode = true;
+      Serial.println("🧪 Modo SIMULACIÓN ACTIVADO");
+      sendAckToGS(msgId);
+      return;
+    }
+
+    else if (strcmp(type, "SIM_OFF") == 0) {
+      simulationMode = false;
+      Serial.println("🛑 Modo SIMULACIÓN DESACTIVADO");
+      sendAckToGS(msgId);
+      return;
+    }
+
+
+    else if (strcmp(type, "MISSION_COMPACT") == 0) {
       Serial.println("📦 Recibido MISSION_COMPACT");
 
       JsonObject d = doc["d"];
@@ -588,6 +669,13 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       Serial.printf("   Acción:   %s\n", mission.event_action.c_str());
       Serial.printf("   Waypoints: %d\n", mission.polygon.size());
 
+      generateMissionPath(mission);     // ← genera lista de puntos interpolados (cada X metros)
+      state = NAVIGATE;          // ← entra al modo de navegación automática
+      currentWaypoint = 0;                  // ← reinicia el contador de puntos
+      analysisResult = NONE;            // ← limpia resultados anteriores
+      missionStartTime = millis();      // ← registra inicio de misión
+      Serial.println("🚀 Misión cargada, FSM activada (estado: NAVIGATE)");
+
       sendAckToGS(doc["id"].as<String>());
       return;
     }  // ✅ cierre del bloque MISSION_COMPACT
@@ -597,18 +685,37 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
   // ==========================================================
   // 🔹 2. Mensajes internos del dron (desde RPi / simulador)
   // ==========================================================
-  if (strcmp(type, "FIRE") == 0 || strcmp(type, "PERSON") == 0) {
-    Serial.printf("🔥 [RPI] Evento recibido: %s\n", type);
 
+  // 🔸 Compatibilidad extendida: acepta "ANALYSIS_RESULT" o mensajes simples ("GO", "FIRE", "PERSON")
+  
+  else if (strcmp(type, "GO") == 0) {
+    analysisResult = GO;
+    Serial.println("📩 [RPI] Resultado recibido: GO → continuar misión");
+    return;
+  }
+  else if (strcmp(type, "FIRE") == 0) {
+    analysisResult = FIRE;
+    Serial.println("🔥 [RPI] Resultado recibido: FIRE → evento detectado");
     unsigned long ts = 0;
     if (gps.date.isValid() && gps.time.isValid()) {
       ts = toUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
                       gps.time.hour(), gps.time.minute(), gps.time.second());
     }
-
     sendEventToGS(type, lat_f, lon_f, alt_f, ts);
     return;
   }
+  else if (strcmp(type, "PERSON") == 0) {
+    analysisResult = PERSON;
+    Serial.println("🧍 [RPI] Resultado recibido: PERSON → evento detectado");
+    unsigned long ts = 0;
+    if (gps.date.isValid() && gps.time.isValid()) {
+      ts = toUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
+                      gps.time.hour(), gps.time.minute(), gps.time.second());
+    }
+    sendEventToGS(type, lat_f, lon_f, alt_f, ts);
+    return;
+  }
+
 
   Serial.printf("⚠️ [RPI] Evento desconocido: %s\n", type);
 }
@@ -619,22 +726,33 @@ void updateGPS(){
   while(SerialGPS.available()){gps.encode(SerialGPS.read());}
 }
 
-void handleTelemetry(){
-  static unsigned long lastTelemetryTime=0;
-  if(millis()-lastTelemetryTime>=1000){
-    updateAltitudeBaro();
-    if(gps.location.isValid()){
-      double lat,lon,alt_dum;
-      filterGPS(gps.location.lat(),gps.location.lng(),gps.altitude.meters(),lat,lon,alt_dum);
-      unsigned long ts=0;
-      if(gps.date.isValid()&&gps.time.isValid()){
-        ts=toUnixTime(gps.date.year(),gps.date.month(),gps.date.day(),gps.time.hour(),gps.time.minute(),gps.time.second());
+void handleTelemetry() {
+  static unsigned long lastTelemetryTime = 0;
+  if (millis() - lastTelemetryTime >= 1000) {
+
+    if (!simulationMode) {
+      updateAltitudeBaro();
+      if (gps.location.isValid()) {
+        double lat, lon, alt_dum;
+        filterGPS(gps.location.lat(), gps.location.lng(),
+                  gps.altitude.meters(), lat, lon, alt_dum);
+        unsigned long ts = 0;
+        if (gps.date.isValid() && gps.time.isValid()) {
+          ts = toUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
+                          gps.time.hour(), gps.time.minute(), gps.time.second());
+        }
+        sendTelemetry(lat, lon, alt_baro_f, gps.speed.kmph(), gps.course.deg(), ts);
       }
-      sendTelemetry(lat,lon,alt_baro_f,gps.speed.kmph(),gps.course.deg(),ts);
-      lastTelemetryTime=millis();
+    } else {
+      // 🔹 En modo simulación, enviar posición virtual
+      unsigned long ts = millis();
+      sendTelemetry(lat_f, lon_f, alt_baro_f, 5.0, 0.0, ts);
     }
+
+    lastTelemetryTime = millis();
   }
 }
+
 
 // ============================================================================
 // 🔄 Comunicación UART1 (Raspberry simulada)
@@ -660,6 +778,20 @@ void handleSerialRPI() {
   }
 }
 
+void sendStableToRPi(const Coordinate &pos) {
+  StaticJsonDocument<128> doc;
+  doc["t"] = "STABLE";
+  doc["lat"] = pos.lat;
+  doc["lon"] = pos.lon;
+  doc["ts"] = millis();
+
+  String payload;
+  serializeJson(doc, payload);
+  SerialRPI.println(payload);
+
+  Serial.println("📤 Enviado a RPi: " + payload);
+}
+
 
 void handleLoRa(){
   int size=LoRa.parsePacket();
@@ -668,67 +800,331 @@ void handleLoRa(){
   while(extractNextFrame(loraRxBuf,js,GS_HDR)){processIncomingJSON(js,true);}
 }
 
+// ============================================================
+// Funciones navegacion
+// ============================================================
 
-// ============================================================
-// 🧭 Simulación de vuelo simple con estabilización de cámaras
-// ============================================================
-void simulateFlight(const Coordinate& start,
-                    const Coordinate& end,
-                    double altitude,
-                    int steps,
-                    unsigned long stepTime) {
+void generateMissionPath(Mission& m) {
+  pathPoints.clear();
+  if (m.polygon.size() < 1) return;
+
+  // Por ahora: HOME -> primer vértice del polígono, con spacing en metros
+  Coordinate start = m.home;
+  Coordinate end   = m.polygon[0];
+
   double totalDist = haversineDistance(start.lat, start.lon, end.lat, end.lon);
-  Serial.printf("✈️ Simulando vuelo de %.1f m en %d pasos...\n", totalDist, steps);
-
-  double dLat = (end.lat - start.lat) / steps;
-  double dLon = (end.lon - start.lon) / steps;
-
-  double accumulated = 0.0;
-  double lastLat = start.lat;
-  double lastLon = start.lon;
+  int steps = (m.spacing > 0.5) ? (int)(totalDist / m.spacing) : 1;
+  if (steps < 1) steps = 1;
 
   for (int i = 0; i <= steps; i++) {
-    double lat = start.lat + i * dLat;
-    double lon = start.lon + i * dLon;
-
-    double stepDist = haversineDistance(lastLat, lastLon, lat, lon);
-    accumulated += stepDist;
-    lastLat = lat;
-    lastLon = lon;
-
-    unsigned long ts = millis();
-    sendTelemetry(lat, lon, altitude, 5.0, 0.0, ts);
-
-    Serial.printf("   📡 Paso %2d → %.6f, %.6f  (dist=%.2f m, total=%.2f m)\n",
-                  i, lat, lon, stepDist, accumulated);
-
-    // 📷 Cada 5 metros, estabilizar cámaras y enviar mensaje al RPi
-    if (accumulated >= 5.0) {
-      Serial.println("📷 Estabilizando cámaras...");
-
-      // Crear JSON para enviar al RPi
-      StaticJsonDocument<128> stableMsg;
-      stableMsg["t"] = "STABLE";
-      stableMsg["lat"] = lat;
-      stableMsg["lon"] = lon;
-      stableMsg["ts"] = millis();
-
-      String jsonStr;
-      serializeJson(stableMsg, jsonStr);
-      SerialRPI.println(jsonStr);
-
-      Serial.println("📤 Enviado a RPi: " + jsonStr);
-
-      delay(5000);  // tiempo de estabilización
-      accumulated = 0.0;
-      handleSerialRPI();
-    }
-
-    delay(stepTime);
+    double t = (double)i / (double)steps;
+    Coordinate pt;
+    pt.lat = start.lat + (end.lat - start.lat) * t;
+    pt.lon = start.lon + (end.lon - start.lon) * t;
+    pathPoints.push_back(pt);
   }
 
-  Serial.println("🛬 Fin de simulación, destino alcanzado.");
+  Serial.printf("🧭 Generados %d puntos entre HOME y destino (spacing=%.1f m, dist=%.1f m)\n",
+                (int)pathPoints.size(), m.spacing, totalDist);
 }
+
+void navigateTo(const Coordinate& target) {
+  double bearing = computeBearing(lat_f, lon_f, target.lat, target.lon);
+  double dist = haversineDistance(lat_f, lon_f, target.lat, target.lon);
+
+  Serial.printf("🧭 NAV → bearing=%.1f°, dist=%.1f m (lat=%.6f, lon=%.6f → %.6f, %.6f)\n",
+                bearing, dist, lat_f, lon_f, target.lat, target.lon);
+
+  // 🧩 Simulación: mover el dron una fracción hacia el destino
+  if (dist > 0.3) { // solo si queda distancia
+    double stepFrac = 0.05; // 5 % de avance por ciclo (~20 iteraciones por tramo)
+    lat_f += (target.lat - lat_f) * stepFrac;
+    lon_f += (target.lon - lon_f) * stepFrac;
+  }
+}
+
+// ============================================================
+// Máquina de estados para vuelo
+// ============================================================
+void updateStateMachine() {
+  switch (state) {
+
+    case IDLE:
+      // Espera una misión
+      break;
+
+    case TAKEOFF:
+      if (alt_baro_f >= mission.altitude) {
+        Serial.println("✅ Altitud alcanzada, iniciando navegación");
+        state = NAVIGATE;
+        stateEntryTime = millis();
+      }
+      break;
+
+    case NAVIGATE:
+      if (currentWaypoint >= pathPoints.size()) {
+        Serial.println("🏁 Fin del recorrido → Retorno a HOME");
+        state = RETURN_HOME;
+        break;
+      }
+
+      {
+        Coordinate target = pathPoints[currentWaypoint];
+        double dist = haversineDistance(lat_f, lon_f, target.lat, target.lon);
+
+        if (dist < 2.0) {
+          Serial.printf("📍 Waypoint %d alcanzado\n", currentWaypoint);
+          sendStableToRPi(target);
+          state = STABILIZE;
+          stateEntryTime = millis();
+        } else {
+          navigateTo(target); // TODO: función PWM + orientación
+        }
+      }
+      break;
+
+    case STABILIZE:
+      if (millis() - stateEntryTime > 300) {
+        Serial.println("📷 Esperando resultado de análisis...");
+        analysisStartTime = millis();
+        state = WAIT_ANALYSIS;
+      }
+      break;
+
+    case WAIT_ANALYSIS:
+      // 🔹 Interrupciones LoRa prioritarias
+      if (loraReturnCommand) {
+        Serial.println("⚠️ RETURN por LoRa → volviendo a HOME");
+        loraReturnCommand = false;
+        state = RETURN_HOME;
+        break;
+      }
+      if (loraDisarmCommand) {
+        Serial.println("🛑 DISARM por LoRa → misión abortada");
+        resetMissionState();
+        break;
+      }
+
+      // 🔹 Evaluar resultado del análisis
+      if (analysisResult != NONE) {
+        if (analysisResult == GO) {
+          Serial.println("▶️ GO recibido → continuar al siguiente punto");
+          currentWaypoint++;
+          state = NAVIGATE;
+        }
+        else if (analysisResult == FIRE || analysisResult == PERSON) {
+          if (mission.event_action.equalsIgnoreCase("RETURN")) {
+            Serial.println("🔥 Evento detectado → misión configurada para RETURN → regresando a HOME");
+            state = RETURN_HOME;
+          }
+          else if (mission.event_action.equalsIgnoreCase("CONTINUE")) {
+            Serial.println("🔥 Evento detectado → misión configurada para CONTINUE → continuar con recorrido");
+            currentWaypoint++;
+            state = NAVIGATE;
+          }
+          else {
+            Serial.println("⚠️ Evento detectado pero sin acción definida → continuar por defecto");
+            currentWaypoint++;
+            state = NAVIGATE;
+          }
+        }
+
+        // Limpiar resultado
+        analysisResult = NONE;
+      }
+
+      // 🔹 Timeout sin respuesta del RPi
+      else if (millis() - analysisStartTime > ANALYSIS_TIMEOUT) {
+        Serial.println("⌛ Timeout de análisis → continuar automáticamente");
+        currentWaypoint++;
+        analysisResult = NONE;
+        state = NAVIGATE;
+      }
+      break;
+
+
+    case RETURN_HOME:
+      {
+        double distHome = haversineDistance(lat_f, lon_f, mission.home.lat, mission.home.lon);
+        if (distHome < 2.0) {
+          Serial.println("🏠 HOME alcanzado → aterrizando");
+          state = LAND;
+        } else {
+          navigateTo(mission.home);
+        }
+      }
+      break;
+
+    case LAND:
+      if (alt_baro_f < 1.0) {
+        Serial.println("🛬 Aterrizaje completo");
+        state = COMPLETE;
+      }
+      break;
+
+    case COMPLETE:
+      Serial.println("✅ Misión completada");
+      resetMissionState();
+      break;
+  }
+}
+
+void resetMissionState() {
+  currentWaypoint = 0;
+  pathPoints.clear();
+  mission.loaded = false;
+  analysisResult = NONE;
+  loraReturnCommand = false;
+  loraDisarmCommand = false;
+  state = IDLE;
+  Serial.println("🔄 Estado reiniciado (IDLE)");
+}
+
+// ============================================================================
+// 🚀 SIMULADOR DE MOVIMIENTO DEL DRON (TEST FSM)
+// ============================================================================
+
+// Simula el avance entre waypoints
+void simulateDroneMotion() {
+  if (!simulationMode || !mission.loaded) return;
+
+  static unsigned long lastStepTime = 0;
+  if (millis() - lastStepTime < 600) return; // velocidad de simulación (~1.5Hz)
+  lastStepTime = millis();
+
+  switch (state) {
+
+    case IDLE:
+      // En simulación, no hace nada hasta recibir misión
+      break;
+
+    case TAKEOFF:
+      alt_baro_f += 0.4;
+      if (alt_baro_f >= mission.altitude) {
+        alt_baro_f = mission.altitude;
+        Serial.println("🛫 [SIM] Altitud alcanzada → iniciando navegación");
+        state = NAVIGATE;
+        stateEntryTime = millis();
+      } else {
+        Serial.printf("⬆️ [SIM] Ascendiendo... alt=%.2f\n", alt_baro_f);
+      }
+      break;
+
+    case NAVIGATE:
+      if (currentWaypoint >= (int)pathPoints.size()) {
+        Serial.println("🏁 [SIM] Fin de ruta → RETURN_HOME");
+        state = RETURN_HOME;
+        break;
+      }
+
+      {
+        Coordinate target = pathPoints[currentWaypoint];
+        double dist = haversineDistance(lat_f, lon_f, target.lat, target.lon);
+
+        // Simular movimiento suave hacia el waypoint
+        lat_f += (target.lat - lat_f) * 0.25;
+        lon_f += (target.lon - lon_f) * 0.25;
+        alt_baro_f = mission.altitude;
+
+        Serial.printf("🧭 [SIM] NAV → WP%d dist=%.2fm\n", currentWaypoint, dist);
+
+        // Si llega, se detiene para análisis
+        if (dist < 1.5) {
+          Serial.printf("✅ [SIM] Waypoint %d alcanzado → STABILIZE\n", currentWaypoint);
+          sendStableToRPi(target);
+          state = STABILIZE;
+          stateEntryTime = millis();
+        }
+      }
+      break;
+
+    case STABILIZE:
+      // En simulación no se mueve; espera resultado de análisis
+      if (millis() - stateEntryTime > 300) {
+        Serial.println("📷 [SIM] Esperando resultado de análisis...");
+        analysisStartTime = millis();
+        state = WAIT_ANALYSIS;
+      }
+      break;
+
+    case WAIT_ANALYSIS:
+      // 🔹 Reacción a comandos de LoRa (interrupciones)
+      if (loraReturnCommand) {
+        Serial.println("⚠️ [SIM] RETURN recibido → volviendo a HOME");
+        loraReturnCommand = false;
+        state = RETURN_HOME;
+        break;
+      }
+      if (loraDisarmCommand) {
+        Serial.println("🛑 [SIM] DISARM recibido → abortando misión");
+        resetMissionState();
+        break;
+      }
+
+      // 🔹 Resultado del análisis
+      if (analysisResult == GO) {
+        Serial.println("➡️ [SIM] Resultado: GO → siguiente WP");
+        currentWaypoint++;
+        analysisResult = NONE;
+        state = NAVIGATE;
+      }
+      else if ((analysisResult == FIRE || analysisResult == PERSON)) {
+        Serial.printf("🔥 [SIM] Resultado: %s detectado\n",
+                      (analysisResult == FIRE) ? "FIRE" : "PERSON");
+
+        if (mission.event_action == "RETURN") {
+          Serial.println("↩️ [SIM] event_action=RETURN → RETURN_HOME");
+          state = RETURN_HOME;
+        } else {
+          Serial.println("➡️ [SIM] event_action=CONTINUE → continuar misión");
+          currentWaypoint++;
+          state = NAVIGATE;
+        }
+
+        analysisResult = NONE;
+      }
+
+      // 🔹 Timeout
+      else if (millis() - analysisStartTime > ANALYSIS_TIMEOUT) {
+        Serial.println("⌛ [SIM] Timeout de análisis → CONTINUE");
+        currentWaypoint++;
+        analysisResult = NONE;
+        state = NAVIGATE;
+      }
+      break;
+
+    case RETURN_HOME:
+      lat_f += (mission.home.lat - lat_f) * 0.25;
+      lon_f += (mission.home.lon - lon_f) * 0.25;
+      alt_baro_f = max(alt_baro_f - 0.05, 0.0);
+
+      {
+        double distHome = haversineDistance(lat_f, lon_f, mission.home.lat, mission.home.lon);
+        Serial.printf("🏠 [SIM] RETURN_HOME dist=%.2fm\n", distHome);
+        if (distHome < 1.5) {
+          Serial.println("🛬 [SIM] HOME alcanzado → LAND");
+          state = LAND;
+        }
+      }
+      break;
+
+    case LAND:
+      alt_baro_f = max(alt_baro_f - 0.15, 0.0);
+      Serial.printf("⬇️ [SIM] Descendiendo... alt=%.2f\n", alt_baro_f);
+      if (alt_baro_f <= 0.5) {
+        Serial.println("🟢 [SIM] Aterrizaje completado");
+        state = COMPLETE;
+      }
+      break;
+
+    case COMPLETE:
+      Serial.println("✅ [SIM] Misión finalizada");
+      resetMissionState();
+      break;
+  }
+}
+
+
 // ============================================================================
 // 🚀 SETUP Y LOOP PRINCIPALES
 // ============================================================================
@@ -763,9 +1159,7 @@ void loop(){
   handleSerialRPI();
   handleLoRa();
   checkPendingAcks();
-  if (mission.loaded && mission.polygon.size() >= 1) {
-    simulateFlight(mission.home, mission.polygon[0], mission.altitude, 30, 300);
-    simulateFlight(mission.polygon[0], mission.home,  mission.altitude, 30, 300);
-  
-  }
+  updateStateMachine();
+  simulateDroneMotion();
+
 }
