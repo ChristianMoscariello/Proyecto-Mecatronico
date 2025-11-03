@@ -89,6 +89,8 @@ std::vector<Coordinate> pathPoints;
 
 // Timeout de análisis (5 s)
 const unsigned long ANALYSIS_TIMEOUT = 5000;
+// Timeout de análisis (90 s)
+const unsigned long ANALYSIS_TIMEOUT = 90000;
 unsigned long analysisStartTime = 0;
 
 // Interrupciones por LoRa
