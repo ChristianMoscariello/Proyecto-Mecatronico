@@ -48,11 +48,23 @@ String generateMsgID() {
   return String(nextMsgCounter);
 }
 
+// 🔸 Generar valor aleatorio de confianza (0.72–0.98)
+float generateRandomConfidence() {
+  // random(720, 980) devuelve enteros en ese rango → /1000 para escala [0–1]
+  int raw = random(720, 981);
+  return raw / 1000.0f;
+}
+
 // 🔸 Enviar mensaje de análisis (fire, person o go)
 void sendAnalysisResult(const char* result) {
   StaticJsonDocument<128> doc;
-  doc["t"] = result;  // "fire", "person" o "go"
+  doc["t"] = result;        // "FIRE", "PERSON" o "GO"
   doc["ts"] = millis();
+
+  // Solo FIRE y PERSON incluyen confianza
+  if (strcmp(result, "FIRE") == 0 || strcmp(result, "PERSON") == 0) {
+    doc["confidence"] = generateRandomConfidence();
+  }
 
   String payload;
   serializeJson(doc, payload);
@@ -79,7 +91,7 @@ void processIncomingJSON(const String& jsonIn) {
   if (strcmp(type, "STABLE") == 0) {
     Serial.println("📷 [STABLE] recibido del dron:");
     Serial.printf("   ↳ Lat: %.6f | Lon: %.6f | ts: %lu\n", lat, lon, ts);
-    blinkLedPattern(3, 200, 200); // tres parpadeos normales
+    blinkLedPattern(3, 200, 200);
   } else {
     Serial.print("ℹ️ Tipo desconocido: ");
     Serial.println(type);
@@ -113,6 +125,8 @@ void setup() {
   pinMode(GO_BTN, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
 
+  randomSeed(analogRead(0));  // inicializa generador de aleatorios
+
   Serial.println("🚀 Simulador de RPi listo. Pulsa:");
   Serial.println("   🔥 GPIO12 → FIRE");
   Serial.println("   🧍 GPIO13 → PERSON");
@@ -134,7 +148,7 @@ void loop() {
     lastDebounceFire = millis();
     Serial.println("🔥 FIRE activado");
     sendAnalysisResult("FIRE");
-    blinkLedPattern(3, 100, 100); // 3 parpadeos rápidos
+    blinkLedPattern(3, 100, 100);
   }
 
   // PERSON pulsado
@@ -142,7 +156,7 @@ void loop() {
     lastDebouncePerson = millis();
     Serial.println("🧍 PERSON activado");
     sendAnalysisResult("PERSON");
-    blinkLedPattern(2, 250, 250); // 2 parpadeos lentos
+    blinkLedPattern(2, 250, 250);
   }
 
   // GO pulsado
@@ -150,11 +164,10 @@ void loop() {
     lastDebounceGo = millis();
     Serial.println("▶️ GO activado");
     sendAnalysisResult("GO");
-    blinkLedPattern(1, 400, 150); // 1 parpadeo largo
+    blinkLedPattern(1, 400, 150);
   }
 
   lastFireState = fireState;
   lastPersonState = personState;
   lastGoState = goState;
 }
-

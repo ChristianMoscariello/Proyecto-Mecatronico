@@ -49,6 +49,11 @@ String loraRxBuf;
 #define RPI_RX  32
 #define RPI_TX  33
 HardwareSerial SerialRPI(1);
+#define RPI_BUFFER_SIZE 256
+#define RPI_TIMEOUT_MS  50
+char rpiBuffer[RPI_BUFFER_SIZE];
+size_t rpiIndex = 0;
+bool receivingJson = false;
 
 // --- IMU MPU9250 ---
 bfs::Mpu9250 mpu(&Wire, bfs::Mpu9250::I2C_ADDR_PRIM);
@@ -59,6 +64,9 @@ float roll = 0, pitch = 0, yaw = 0;
 static float fusedYaw = 0;
 unsigned long lastIMUUpdate = 0;
 const float ALPHA_YAW = 0.02f;  // fusión yaw lenta
+// → Ajuste de declinación magnética para Adrogué / Buenos Aires
+const float MAG_DECLINATION_DEG = -9.9f;
+
 
 // Filtros EMA para acelerómetro y giroscopio
 const float ALPHA_ACC  = 0.2f;
@@ -102,6 +110,23 @@ struct {
 } magCal;
 
 String magQuality = "GOOD";
+
+struct PIDParams {
+  float kp;
+  float ki;
+  float kd;
+};
+
+struct PIDSet {
+  PIDParams accel;
+  PIDParams roll_lr;
+  PIDParams roll_fb;
+  PIDParams rudder;
+  PIDParams sw;
+};
+
+PIDSet pidConfig;   // configuración actual de PID
+Preferences pidPrefs;
 
 // ============================================================
 // 🧭 Máquina de estados del dron
@@ -192,6 +217,30 @@ void loadIMUCalibration() {
   prefs.getBytes("magScale",  imuCal.magScale,  sizeof(imuCal.magScale));
   prefs.end();
   Serial.println("📥 Calibraciones IMU cargadas");
+}
+
+void savePID() {
+  pidPrefs.begin("pid", false);
+  pidPrefs.putBytes("config", &pidConfig, sizeof(pidConfig));
+  pidPrefs.end();
+  Serial.println("💾 PID guardado en NVS");
+}
+
+void loadPID() {
+  pidPrefs.begin("pid", true);
+  if (pidPrefs.getBytes("config", &pidConfig, sizeof(pidConfig)) == 0) {
+    // Default inicial si no hay datos guardados
+    pidConfig.accel  = {1.0, 0.0, 0.0};
+    pidConfig.roll_lr = {1.0, 0.0, 0.0};
+    pidConfig.roll_fb = {1.0, 0.0, 0.0};
+    pidConfig.rudder = {1.0, 0.0, 0.0};
+    pidConfig.sw = {1.0, 0.0, 0.0};
+    savePID();
+    Serial.println("⚙️ PID por defecto cargado");
+  } else {
+    Serial.println("📥 PID cargado desde NVS");
+  }
+  pidPrefs.end();
 }
 
 // ============================================================================
@@ -544,7 +593,7 @@ void sendTrims(){
 // ==========================================================
 // 🔹 Enviar eventos desde RPi (requieren ACK confiable)
 // ==========================================================
-void sendEventToGS(const String &topic, double lat, double lon, double alt, unsigned long ts) {
+void sendEventToGS(const String &topic, double lat, double lon, double alt, unsigned long ts, float confidence) {
   StaticJsonDocument<256> doc;
   doc["t"] = topic;
 
@@ -553,8 +602,8 @@ void sendEventToGS(const String &topic, double lat, double lon, double alt, unsi
   d["lat"] = lat;
   d["lon"] = lon;
   d["alt"] = alt;
-
-  // Generar ID único
+  d["confidence"] = confidence;
+   // Generar ID único
   String msgID = generateMsgID();
   doc["id"] = msgID;
   doc["ts"] = ts;
@@ -640,6 +689,88 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       return;
     }
 
+    // =============================================================
+    // 🧭 CONFIGURACIÓN PID - GET_PID / PID_SET
+    // =============================================================
+
+    else if (strcmp(type, "GET_PID") == 0) {
+      StaticJsonDocument<384> docOut;
+      docOut["t"] = "PID_DATA";
+      JsonObject d = docOut.createNestedObject("d");
+
+      // --- ACCEL ---
+      JsonObject accel = d.createNestedObject("ACCEL");
+      accel["kp"] = pidConfig.accel.kp;
+      accel["ki"] = pidConfig.accel.ki;
+      accel["kd"] = pidConfig.accel.kd;
+
+      // --- ROLL_LR ---
+      JsonObject roll_lr = d.createNestedObject("ROLL_LR");
+      roll_lr["kp"] = pidConfig.roll_lr.kp;
+      roll_lr["ki"] = pidConfig.roll_lr.ki;
+      roll_lr["kd"] = pidConfig.roll_lr.kd;
+
+      // --- ROLL_FB ---
+      JsonObject roll_fb = d.createNestedObject("ROLL_FB");
+      roll_fb["kp"] = pidConfig.roll_fb.kp;
+      roll_fb["ki"] = pidConfig.roll_fb.ki;
+      roll_fb["kd"] = pidConfig.roll_fb.kd;
+
+      // --- RUDDER ---
+      JsonObject rudder = d.createNestedObject("RUDDER");
+      rudder["kp"] = pidConfig.rudder.kp;
+      rudder["ki"] = pidConfig.rudder.ki;
+      rudder["kd"] = pidConfig.rudder.kd;
+
+      // --- SWITCH ---
+      JsonObject sw = d.createNestedObject("SWITCH");
+      sw["kp"] = pidConfig.sw.kp;
+      sw["ki"] = pidConfig.sw.ki;
+      sw["kd"] = pidConfig.sw.kd;
+
+      docOut["ts"] = millis();
+      sendJsonNoAckToGS(docOut);
+      sendAckToGS(msgId);
+      Serial.println("📤 PID enviados a GS");
+      return;
+    }
+
+    else if (strcmp(type, "PID_SET") == 0) {
+      JsonObject d = doc["d"];
+      if (!d.isNull()) {
+        // --- ACCEL ---
+        pidConfig.accel.kp = d["ACCEL"]["kp"] | pidConfig.accel.kp;
+        pidConfig.accel.ki = d["ACCEL"]["ki"] | pidConfig.accel.ki;
+        pidConfig.accel.kd = d["ACCEL"]["kd"] | pidConfig.accel.kd;
+
+        // --- ROLL_LR ---
+        pidConfig.roll_lr.kp = d["ROLL_LR"]["kp"] | pidConfig.roll_lr.kp;
+        pidConfig.roll_lr.ki = d["ROLL_LR"]["ki"] | pidConfig.roll_lr.ki;
+        pidConfig.roll_lr.kd = d["ROLL_LR"]["kd"] | pidConfig.roll_lr.kd;
+
+        // --- ROLL_FB ---
+        pidConfig.roll_fb.kp = d["ROLL_FB"]["kp"] | pidConfig.roll_fb.kp;
+        pidConfig.roll_fb.ki = d["ROLL_FB"]["ki"] | pidConfig.roll_fb.ki;
+        pidConfig.roll_fb.kd = d["ROLL_FB"]["kd"] | pidConfig.roll_fb.kd;
+
+        // --- RUDDER ---
+        pidConfig.rudder.kp = d["RUDDER"]["kp"] | pidConfig.rudder.kp;
+        pidConfig.rudder.ki = d["RUDDER"]["ki"] | pidConfig.rudder.ki;
+        pidConfig.rudder.kd = d["RUDDER"]["kd"] | pidConfig.rudder.kd;
+
+        // --- SWITCH ---
+        pidConfig.sw.kp = d["SWITCH"]["kp"] | pidConfig.sw.kp;
+        pidConfig.sw.ki = d["SWITCH"]["ki"] | pidConfig.sw.ki;
+        pidConfig.sw.kd = d["SWITCH"]["kd"] | pidConfig.sw.kd;
+
+        savePID();
+        sendAckToGS(msgId);
+        Serial.println("✅ PID actualizado desde GS y guardado en NVS");
+      }
+      return;
+    }
+
+
     else if (strcmp(type, "GRIPPER") == 0) {
       Serial.println("🦾 GRIPPER recibido (placeholder)");
       sendAckToGS(msgId);
@@ -683,7 +814,7 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
 
     else if (strcmp(type, "CALIB_MAG") == 0) {
       Serial.println("🧭 CALIB_MAG recibido desde GS");
-      startMagCalibration(12000);    // 12 s
+      startMagCalibration(30000);    // 30 s
       sendAckToGS(doc["id"] | "");   // si usás ACK
       return;
     }
@@ -771,25 +902,37 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
     analysisResult = FIRE;
     Serial.println("🔥 [RPI] Resultado recibido: FIRE → evento detectado");
     unsigned long ts = 0;
+
+    float confidence = -1;
+    if (doc.containsKey("confidence")) confidence = doc["confidence"];
+    else if (doc.containsKey("d") && doc["d"].containsKey("confidence"))
+      confidence = doc["d"]["confidence"];
+
     if (gps.date.isValid() && gps.time.isValid()) {
       ts = toUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
                       gps.time.hour(), gps.time.minute(), gps.time.second());
     }
-    sendEventToGS(type, lat_f, lon_f, alt_f, ts);
+    sendEventToGS(type, lat_f, lon_f, alt_f, ts, confidence);
     return;
   }
+
   else if (strcmp(type, "PERSON") == 0) {
     analysisResult = PERSON;
     Serial.println("🧍 [RPI] Resultado recibido: PERSON → evento detectado");
     unsigned long ts = 0;
+
+    float confidence = -1;
+    if (doc.containsKey("confidence")) confidence = doc["confidence"];
+    else if (doc.containsKey("d") && doc["d"].containsKey("confidence"))
+      confidence = doc["d"]["confidence"];
+
     if (gps.date.isValid() && gps.time.isValid()) {
       ts = toUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
                       gps.time.hour(), gps.time.minute(), gps.time.second());
     }
-    sendEventToGS(type, lat_f, lon_f, alt_f, ts);
+    sendEventToGS(type, lat_f, lon_f, alt_f, ts, confidence);
     return;
   }
-
 
   Serial.printf("⚠️ [RPI] Evento desconocido: %s\n", type);
 }
@@ -832,22 +975,51 @@ void handleTelemetry() {
 // 🔄 Comunicación UART1 (Raspberry simulada)
 // ============================================================================
 void handleSerialRPI() {
-  // Verificar si hay bytes disponibles
-  while (SerialRPI.available()) {
-    String jsonIn = SerialRPI.readStringUntil('\n');  // lee hasta fin de JSON
-    jsonIn.trim();
+  while (SerialRPI.available() > 0) {
+    char c = (char)SerialRPI.read();
 
-    // --- Depuración serial ---
-    if (jsonIn.length() > 0) {
-      Serial.print("[RPI] 📥 Mensaje recibido UART1 → ");
-      Serial.println(jsonIn);
+    // Buscar inicio de JSON
+    if (!receivingJson) {
+      if (c == '{') {
+        receivingJson = true;
+        rpiIndex = 0;
+        rpiBuffer[rpiIndex++] = c;
+      }
+      continue;
     }
 
-    // Validar si tiene formato JSON
-    if (jsonIn.startsWith("{") && jsonIn.endsWith("}")) {
-      processIncomingJSON(jsonIn, false);
-    } else {
-      Serial.println("[RPI] ⚠️ Mensaje inválido o incompleto");
+    // Acumular bytes del JSON
+    if (receivingJson) {
+      if (rpiIndex < RPI_BUFFER_SIZE - 1) {
+        rpiBuffer[rpiIndex++] = c;
+      } else {
+        Serial.println("[RPI] ⚠️ Overflow de buffer, reinicio.");
+        receivingJson = false;
+        rpiIndex = 0;
+        memset(rpiBuffer, 0, sizeof(rpiBuffer));
+        continue;
+      }
+
+      // Fin del JSON detectado
+      if (c == '}') {
+        rpiBuffer[rpiIndex] = '\0';
+        receivingJson = false;
+
+        StaticJsonDocument<256> doc;
+        DeserializationError err = deserializeJson(doc, rpiBuffer);
+
+        if (!err) {
+          // ✅ Serializar a String antes de pasarlo a processIncomingJSON()
+          String jsonStr;
+          serializeJson(doc, jsonStr);
+          processIncomingJSON(jsonStr, false);
+        } else {
+          Serial.printf("[RPI] ⚠️ Error JSON: %s\n", err.c_str());
+        }
+
+        memset(rpiBuffer, 0, sizeof(rpiBuffer));
+        rpiIndex = 0;
+      }
     }
   }
 }
@@ -995,24 +1167,29 @@ void updateYawFusion(float gz, float dt, float yawMag) {
   if (fusedYaw >= 360.0f) fusedYaw -= 360.0f;
   fusedYaw = (1 - ALPHA_YAW) * fusedYaw + ALPHA_YAW * yawMag;
   yaw_f = fusedYaw;
+  // Aplicar declinación magnética local
+  yaw_f += MAG_DECLINATION_DEG;
+  if (yaw_f < 0.0f) yaw_f += 360.0f;
+  if (yaw_f >= 360.0f) yaw_f -= 360.0f;
+
 }
 
 //----Actualización IMU (filtrada)----
 void updateIMU() {
   if (!mpuReady) return;
   if (!mpu.Read()) return;  // Actualiza buffers internos
-
+  
   static unsigned long last = millis();
   float dt = (millis() - last) / 1000.0f;
   last = millis();
 
   // --- Lecturas brutas --- Valor bias
-float ax = mpu.accel_x_mps2() - imuCal.accelBias[0];
-float ay = mpu.accel_y_mps2() - imuCal.accelBias[1];
-float az = mpu.accel_z_mps2() - imuCal.accelBias[2];
-float gx = mpu.gyro_x_radps() - imuCal.gyroBias[0];
-float gy = mpu.gyro_y_radps() - imuCal.gyroBias[1];
-float gz = mpu.gyro_z_radps() - imuCal.gyroBias[2];
+  float ax = mpu.accel_x_mps2() - imuCal.accelBias[0];
+  float ay = mpu.accel_y_mps2() - imuCal.accelBias[1];
+  float az = mpu.accel_z_mps2() - imuCal.accelBias[2];
+  float gx = mpu.gyro_x_radps() - imuCal.gyroBias[0];
+  float gy = mpu.gyro_y_radps() - imuCal.gyroBias[1];
+  float gz = mpu.gyro_z_radps() - imuCal.gyroBias[2];
   float mx = mpu.mag_x_ut();
   float my = mpu.mag_y_ut();
   float mz = mpu.mag_z_ut();
@@ -1030,7 +1207,19 @@ float gz = mpu.gyro_z_radps() - imuCal.gyroBias[2];
   pitch = atan2f(-ax_f, sqrtf(ay_f * ay_f + az_f * az_f)) * RAD_TO_DEG;
 
   float yawMag = computeTiltCompensatedYaw(ax_f, ay_f, az_f, mx, my, mz);
-  updateYawFusion(gz_f, dt, yawMag); //usar yag_f que es la que devuelve del fusionado
+  updateYawFusion(gz_f, dt, yawMag); //usar yaw_f que es la que devuelve del fusionado
+
+  
+ /*Serial.printf("[IMU] Roll: %.2f°, Pitch: %.2f°, Yaw: %.2f° | "
+                "A: %.2f,%.2f,%.2f m/s² | "
+                "G: %.2f,%.2f,%.2f rad/s | "
+                "M: %.2f,%.2f,%.2f uT\n",
+                roll, pitch, yaw_f,
+                ax, ay, az,
+                gx, gy, gz,
+                mx, my, mz);
+  */
+
 }
 
 //----Calibración magnética dinámica----
@@ -1062,105 +1251,126 @@ void startMagCalibration(unsigned long durationMs) {
 void updateMagCalibration() {
   if (!magCal.active || !mpuReady) return;
 
-  // Lectura BFS: cada eje del magnetómetro
-  mpu.Read();
-  float mx = mpu.mag_x_ut();
-  float my = mpu.mag_y_ut();
-  float mz = mpu.mag_z_ut();
+  static std::vector<Eigen::Vector3f> samples;
+  if (magCal.samples == 0) samples.clear();
 
-  // Actualizar extremos
-  magCal.minv[0] = fminf(magCal.minv[0], mx);
-  magCal.minv[1] = fminf(magCal.minv[1], my);
-  magCal.minv[2] = fminf(magCal.minv[2], mz);
-  magCal.maxv[0] = fmaxf(magCal.maxv[0], mx);
-  magCal.maxv[1] = fmaxf(magCal.maxv[1], my);
-  magCal.maxv[2] = fmaxf(magCal.maxv[2], mz);
-  magCal.samples++;
+  // Leer nueva muestra
+  if (mpu.Read()) {
+    Eigen::Vector3f v(mpu.mag_x_ut(), mpu.mag_y_ut(), mpu.mag_z_ut());
+    samples.push_back(v);
+    magCal.samples++;
+  }
 
   // Reporte de progreso cada 500 ms
   static unsigned long lastProg = 0;
   if (millis() - lastProg > 500) {
     lastProg = millis();
 
-    float rngX = magCal.maxv[0] - magCal.minv[0];
-    float rngY = magCal.maxv[1] - magCal.minv[1];
-    float rngZ = magCal.maxv[2] - magCal.minv[2];
-    float coverage = (rngX + rngY + rngZ) / 3.0f;
+    float coverage = 0.00f;
+    if (samples.size() > 5) {
+      // rango aproximado de variación
+      Eigen::Vector3f minv = samples[0];
+      Eigen::Vector3f maxv = samples[0];
+      for (auto &s : samples) {
+        minv = minv.cwiseMin(s);
+        maxv = maxv.cwiseMax(s);
+      }
+      Eigen::Vector3f rng = maxv - minv;
+      coverage = (rng.x() + rng.y() + rng.z()) / 3.0f;
 
-    StaticJsonDocument<224> j;
-    j["t"] = "MAG_CAL_PROGRESS";
-    JsonObject d = j.createNestedObject("d");
-    d["phase"] = "RUN";
-    d["samples"] = magCal.samples;
-    d["rngX"] = rngX;
-    d["rngY"] = rngY;
-    d["rngZ"] = rngZ;
-    d["coverage"] = coverage;
-    j["ts"] = (int)millis();
-    sendJsonNoAckToGS(j);
+      Serial.printf("[MAG_CAL] ΔX=%.1f ΔY=%.1f ΔZ=%.1f | muestras=%d\n",
+                    rng.x(), rng.y(), rng.z(), (int)samples.size());
+
+      StaticJsonDocument<224> j;
+      j["t"] = "MAG_CAL_PROGRESS";
+      JsonObject d = j.createNestedObject("d");
+      d["phase"] = "RUN";
+      d["samples"] = (int)samples.size();
+      d["rngX"] = rng.x();
+      d["rngY"] = rng.y();
+      d["rngZ"] = rng.z();
+      d["coverage"] = coverage;
+      j["ts"] = (int)millis();
+      sendJsonNoAckToGS(j);
+    }
   }
 
   // Evaluar fin de calibración
   if ((millis() - magCal.startMs) > magCal.minDurationMs) {
-    float rngX = magCal.maxv[0] - magCal.minv[0];
-    float rngY = magCal.maxv[1] - magCal.minv[1];
-    float rngZ = magCal.maxv[2] - magCal.minv[2];
-
-    if (rngX > 25 && rngY > 25 && rngZ > 25) {
-      // Hard-iron offset
-      imuCal.magBias[0] = (magCal.maxv[0] + magCal.minv[0]) * 0.5f;
-      imuCal.magBias[1] = (magCal.maxv[1] + magCal.minv[1]) * 0.5f;
-      imuCal.magBias[2] = (magCal.maxv[2] + magCal.minv[2]) * 0.5f;
-
-      // Soft-iron scaling (normalización por media)
-      float scaleX = (magCal.maxv[0] - magCal.minv[0]) * 0.5f;
-      float scaleY = (magCal.maxv[1] - magCal.minv[1]) * 0.5f;
-      float scaleZ = (magCal.maxv[2] - magCal.minv[2]) * 0.5f;
-      float avg = (scaleX + scaleY + scaleZ) / 3.0f;
-
-      imuCal.magScale[0] = avg / scaleX;
-      imuCal.magScale[1] = avg / scaleY;
-      imuCal.magScale[2] = avg / scaleZ;
-
-      // Guardar calibración
-      saveIMUCalibration();
-      loadIMUCalibration();
-
-      // Métrica de simetría
-      float sym = fminf(fminf(scaleX, fminf(scaleY, scaleZ)) /
-                        fmaxf(scaleX, fmaxf(scaleY, scaleZ)), 1.0f);
-
-      // Reporte de resultado a la GS
-      StaticJsonDocument<320> j;
-      j["t"] = "MAG_CAL_RESULT";
-      JsonObject d = j.createNestedObject("d");
-      JsonObject bias = d.createNestedObject("bias");
-      bias["x"] = imuCal.magBias[0];
-      bias["y"] = imuCal.magBias[1];
-      bias["z"] = imuCal.magBias[2];
-      JsonObject scale = d.createNestedObject("scale");
-      scale["x"] = imuCal.magScale[0];
-      scale["y"] = imuCal.magScale[1];
-      scale["z"] = imuCal.magScale[2];
-      d["symmetry"] = sym;
-      d["samples"] = magCal.samples;
-      d["result"] = (sym > 0.7f ? "OK" : "FAIR");
-      j["ts"] = (int)millis();
-      sendJsonNoAckToGS(j);
-
-      Serial.println("✅ MAG calibrado (hard/soft-iron) y guardado");
-    } else {
-      // Cobertura insuficiente
+    if (samples.size() < 50) {
+      Serial.println("⚠️ MAG cal: muestras insuficientes");
       StaticJsonDocument<160> j;
       j["t"] = "MAG_CAL_RESULT";
-      j["d"]["result"] = "INSUFFICIENT_COVERAGE";
-      j["d"]["samples"] = magCal.samples;
+      j["d"]["result"] = "INSUFFICIENT_SAMPLES";
+      j["d"]["samples"] = (int)samples.size();
       j["ts"] = (int)millis();
       sendJsonNoAckToGS(j);
-      Serial.println("⚠️ MAG cal: cobertura insuficiente");
+      magCal.active = false;
+      samples.clear();
+      return;
     }
 
-    magCal.active = false;
+    // --- Calcular bias y covarianza ---
+    Eigen::Vector3f mean = Eigen::Vector3f::Zero();
+    for (auto &s : samples) mean += s;
+    mean /= (float)samples.size();
+
+    Eigen::Matrix3f cov = Eigen::Matrix3f::Zero();
+    for (auto &s : samples) {
+      Eigen::Vector3f d = s - mean;
+      cov += d * d.transpose();
+    }
+    cov /= (float)(samples.size() - 1);
+
+    // --- Eigenvalores/eigenvectores ---
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(cov);
+    Eigen::Vector3f eigVal = solver.eigenvalues();
+    Eigen::Matrix3f eigVec = solver.eigenvectors();
+
+    // --- Calcular escalas relativas ---
+    float avg = (eigVal.x() + eigVal.y() + eigVal.z()) / 3.0f;
+    Eigen::Vector3f scaleVec = (avg / eigVal.array()).sqrt();
+
+    // Guardar bias (hard-iron) y scale (soft-iron) compensadas
+    imuCal.magBias[0] = mean.x();
+    imuCal.magBias[1] = mean.y();
+    imuCal.magBias[2] = mean.z();
+    imuCal.magScale[0] = scaleVec.x();
+    imuCal.magScale[1] = scaleVec.y();
+    imuCal.magScale[2] = scaleVec.z();
+
+    saveIMUCalibration();
+    loadIMUCalibration();
+
+        // --- Evaluar calidad ---
+    float minVal = eigVal.minCoeff();
+    float maxVal = eigVal.maxCoeff();
+    float symmetry = fminf(minVal / maxVal, 1.0f);
+    const char* result = (symmetry > 0.75f ? "OK" :
+                          symmetry > 0.6f ? "FAIR" : "POOR");
+
+    // --- Enviar resultado final ---
+    StaticJsonDocument<320> j;
+    j["t"] = "MAG_CAL_RESULT";
+    JsonObject d = j.createNestedObject("d");
+    JsonObject bias = d.createNestedObject("bias");
+    bias["x"] = imuCal.magBias[0];
+    bias["y"] = imuCal.magBias[1];
+    bias["z"] = imuCal.magBias[2];
+    JsonObject scaleObj = d.createNestedObject("scale");
+    scaleObj["x"] = imuCal.magScale[0];
+    scaleObj["y"] = imuCal.magScale[1];
+    scaleObj["z"] = imuCal.magScale[2];
+    d["symmetry"] = symmetry;
+    d["samples"] = (int)samples.size();
+    d["result"] = result;
+    j["ts"] = (int)millis();
+    sendJsonNoAckToGS(j);
+
+    Serial.printf("✅ MAG calibrado — bias(%.2f,%.2f,%.2f) scale(%.2f,%.2f,%.2f) → %s (sym=%.2f)\n",
+                  imuCal.magBias[0], imuCal.magBias[1], imuCal.magBias[2],
+                  imuCal.magScale[0], imuCal.magScale[1], imuCal.magScale[2],
+                  result, symmetry);
 
     // Aviso de fin
     StaticJsonDocument<128> jf;
@@ -1168,8 +1378,14 @@ void updateMagCalibration() {
     jf["d"]["phase"] = "END";
     jf["ts"] = (int)millis();
     sendJsonNoAckToGS(jf);
+
+    magCal.active = false;
+    samples.clear();
+
+
   }
 }
+
 
 //----Chequeo de calidad magnética----
 void checkMagQualitySuggest() {
@@ -1217,14 +1433,14 @@ void checkMagQualitySuggest() {
   else                        magQuality = "BAD";
 
   // 🔹 Reporte de estado a la Ground Station
-  StaticJsonDocument<192> jstatus;
+  /*StaticJsonDocument<192> jstatus;
   jstatus["t"] = "MAG_STATUS";
   JsonObject d = jstatus.createNestedObject("d");
   d["quality"] = magQuality;
   d["deviation"] = deviation;
   d["field"] = magStrength;
   jstatus["ts"] = (int)millis();
-  sendJsonNoAckToGS(jstatus);
+  sendJsonNoAckToGS(jstatus); */
 
   // 🔹 Enviar alerta si el error es persistente
   if (badCount >= badThreshold && !magCal.active) {
@@ -1576,6 +1792,8 @@ void setup(){
   Serial.begin(115200);
   SerialGPS.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
   SerialRPI.begin(9600, SERIAL_8N1, RPI_RX, RPI_TX);
+  SerialRPI.setTimeout(RPI_TIMEOUT_MS);
+  memset(rpiBuffer, 0, sizeof(rpiBuffer));
   Serial.println("✅ UART0 (USB) OK");
   Serial.println("✅ UART2 (GPS) inicializado 9600 bps");
   Serial.println("✅ UART1 (RPI) inicializado 9600 bps");
@@ -1600,15 +1818,26 @@ void setup(){
 }
 
 void loop(){
+  //Serial.println("inicio");
   updateGPS();
+  //Serial.println("gps");
   handleTelemetry();
+  //Serial.println("tm");
   handleSerialRPI();
+  //Serial.println("rpi");
   handleLoRa();
+  //Serial.println("lora");
   checkPendingAcks();
+  //Serial.println("ack");
   updateStateMachine();
+  //Serial.println("fsm");
   simulateDroneMotion();
+  //Serial.println("fsm-sim");
   updateIMU();
+  //Serial.println("imu");
   updateMagCalibration();
+  //Serial.println("magupd");
   checkMagQualitySuggest();
+ // Serial.println("magqua");
 
 }
