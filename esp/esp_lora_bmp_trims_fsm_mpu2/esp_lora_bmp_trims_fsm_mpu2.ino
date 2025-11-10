@@ -11,7 +11,6 @@
 #include <Adafruit_BMP280.h>
 #include <Preferences.h>
 #include <math.h>
-//#include <Vector.h>
 #include <units.h>
 #include <mpu9250.h>
 #include <eigen.h>
@@ -130,11 +129,9 @@ struct PIDSet {
   PIDParams roll_lr;
   PIDParams roll_fb;
   PIDParams rudder;
-  PIDParams sw;
 };
 
 PIDSet pidConfig;   // configuración actual de PID
-Preferences pidPrefs;
 
 // ============================================================
 // 🧭 Máquina de estados del dron
@@ -228,28 +225,30 @@ void loadIMUCalibration() {
 }
 
 void savePID() {
-  pidPrefs.begin("pid", false);
-  pidPrefs.putBytes("config", &pidConfig, sizeof(pidConfig));
-  pidPrefs.end();
-  Serial.println("💾 PID guardado en NVS");
+  prefs.begin("pidConfig", false);
+  size_t written = prefs.putBytes("config", &pidConfig, sizeof(pidConfig));
+  prefs.end();
+  Serial.printf("💾 Guardado PID (%u bytes de %u)\n", written, sizeof(pidConfig));
 }
 
 void loadPID() {
-  pidPrefs.begin("pid", true);
-  if (pidPrefs.getBytes("config", &pidConfig, sizeof(pidConfig)) == 0) {
-    // Default inicial si no hay datos guardados
+  prefs.begin("pidConfig", true);
+  size_t len = prefs.getBytes("config", &pidConfig, sizeof(pidConfig));
+  prefs.end();
+
+  if (len == sizeof(pidConfig)) {
+    Serial.println("📥 PID cargado desde NVS correctamente");
+  } else {
+    Serial.printf("⚠️ PID no encontrado (len=%u), cargando por defecto\n", len);
     pidConfig.accel  = {1.0, 0.0, 0.0};
     pidConfig.roll_lr = {1.0, 0.0, 0.0};
     pidConfig.roll_fb = {1.0, 0.0, 0.0};
     pidConfig.rudder = {1.0, 0.0, 0.0};
-    pidConfig.sw = {1.0, 0.0, 0.0};
     savePID();
-    Serial.println("⚙️ PID por defecto cargado");
-  } else {
-    Serial.println("📥 PID cargado desde NVS");
   }
-  pidPrefs.end();
 }
+
+
 
 // ============================================================================
 // 🔹 FUNCIONES DE UTILIDAD y geodesicas
@@ -656,6 +655,7 @@ bool extractNextFrame(String& buf,String& jsonOut,const char* wantedHdr){
 
 void processIncomingJSON(const String &jsonIn, bool fromGS) {
   StaticJsonDocument<1024> doc;
+  Serial.printf("✅ JSON OK, uso de memoria: %u/%u\n", doc.memoryUsage(), doc.capacity());
   if (deserializeJson(doc, jsonIn)) {
     Serial.println("❌ JSON inválido");
     return;
@@ -730,12 +730,6 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       rudder["ki"] = pidConfig.rudder.ki;
       rudder["kd"] = pidConfig.rudder.kd;
 
-      // --- SWITCH ---
-      JsonObject sw = d.createNestedObject("SWITCH");
-      sw["kp"] = pidConfig.sw.kp;
-      sw["ki"] = pidConfig.sw.ki;
-      sw["kd"] = pidConfig.sw.kd;
-
       docOut["ts"] = millis();
       sendJsonNoAckToGS(docOut);
       sendAckToGS(msgId);
@@ -743,38 +737,74 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       return;
     }
 
+    // =============================================================
+    // ⚙️ PID_SET - Recibir todos los PID desde la Ground Station
+    // =============================================================
     else if (strcmp(type, "PID_SET") == 0) {
-      JsonObject d = doc["d"];
-      if (!d.isNull()) {
-        // --- ACCEL ---
-        pidConfig.accel.kp = d["ACCEL"]["kp"] | pidConfig.accel.kp;
-        pidConfig.accel.ki = d["ACCEL"]["ki"] | pidConfig.accel.ki;
-        pidConfig.accel.kd = d["ACCEL"]["kd"] | pidConfig.accel.kd;
+      // Imprimir mensaje recibido para diagnóstico
+      Serial.printf("📥 RX PID_SET (%d bytes): %s\n", jsonIn.length(), jsonIn.c_str());
 
-        // --- ROLL_LR ---
-        pidConfig.roll_lr.kp = d["ROLL_LR"]["kp"] | pidConfig.roll_lr.kp;
-        pidConfig.roll_lr.ki = d["ROLL_LR"]["ki"] | pidConfig.roll_lr.ki;
-        pidConfig.roll_lr.kd = d["ROLL_LR"]["kd"] | pidConfig.roll_lr.kd;
+      // Documento dedicado para PID (no reusar 'doc' general)
+      StaticJsonDocument<1536> docPID;  // tamaño seguro para 5 canales (~1.3 KB máx)
 
-        // --- ROLL_FB ---
-        pidConfig.roll_fb.kp = d["ROLL_FB"]["kp"] | pidConfig.roll_fb.kp;
-        pidConfig.roll_fb.ki = d["ROLL_FB"]["ki"] | pidConfig.roll_fb.ki;
-        pidConfig.roll_fb.kd = d["ROLL_FB"]["kd"] | pidConfig.roll_fb.kd;
-
-        // --- RUDDER ---
-        pidConfig.rudder.kp = d["RUDDER"]["kp"] | pidConfig.rudder.kp;
-        pidConfig.rudder.ki = d["RUDDER"]["ki"] | pidConfig.rudder.ki;
-        pidConfig.rudder.kd = d["RUDDER"]["kd"] | pidConfig.rudder.kd;
-
-        // --- SWITCH ---
-        pidConfig.sw.kp = d["SWITCH"]["kp"] | pidConfig.sw.kp;
-        pidConfig.sw.ki = d["SWITCH"]["ki"] | pidConfig.sw.ki;
-        pidConfig.sw.kd = d["SWITCH"]["kd"] | pidConfig.sw.kd;
-
-        savePID();
-        sendAckToGS(msgId);
-        Serial.println("✅ PID actualizado desde GS y guardado en NVS");
+      DeserializationError err = deserializeJson(docPID, jsonIn);
+      if (err) {
+        Serial.printf("❌ Error parseando JSON PID_SET: %s\n", err.c_str());
+        return;
       }
+
+      Serial.printf("✅ JSON OK, uso de memoria: %u/%u bytes\n",
+                    docPID.memoryUsage(), docPID.capacity());
+      JsonObject d = docPID["d"]["d"];  // ← acceso al nivel interno correcto
+
+      if (d.isNull()) {
+        Serial.println("⚠️ JSON PID_SET sin objeto 'd'");
+        return;
+      }
+
+      // --- función auxiliar segura ---
+      auto safe_get = [&](const char* ch, const char* field, float current) -> float {
+        if (d.containsKey(ch)) {
+          JsonVariant v = d[ch][field];
+          if (!v.isNull()) {
+            if (v.is<float>()) return v.as<float>();
+            if (v.is<int>())   return (float)v.as<int>();
+            if (v.is<const char*>()) return atof(v.as<const char*>());
+          }
+        }
+        return current;
+      };
+
+      // --- ACCEL ---
+      pidConfig.accel.kp = safe_get("ACCEL", "kp", pidConfig.accel.kp);
+      pidConfig.accel.ki = safe_get("ACCEL", "ki", pidConfig.accel.ki);
+      pidConfig.accel.kd = safe_get("ACCEL", "kd", pidConfig.accel.kd);
+
+      // --- ROLL_LR ---
+      pidConfig.roll_lr.kp = safe_get("ROLL_LR", "kp", pidConfig.roll_lr.kp);
+      pidConfig.roll_lr.ki = safe_get("ROLL_LR", "ki", pidConfig.roll_lr.ki);
+      pidConfig.roll_lr.kd = safe_get("ROLL_LR", "kd", pidConfig.roll_lr.kd);
+
+      // --- ROLL_FB ---
+      pidConfig.roll_fb.kp = safe_get("ROLL_FB", "kp", pidConfig.roll_fb.kp);
+      pidConfig.roll_fb.ki = safe_get("ROLL_FB", "ki", pidConfig.roll_fb.ki);
+      pidConfig.roll_fb.kd = safe_get("ROLL_FB", "kd", pidConfig.roll_fb.kd);
+
+      // --- RUDDER ---
+      pidConfig.rudder.kp = safe_get("RUDDER", "kp", pidConfig.rudder.kp);
+      pidConfig.rudder.ki = safe_get("RUDDER", "ki", pidConfig.rudder.ki);
+      pidConfig.rudder.kd = safe_get("RUDDER", "kd", pidConfig.rudder.kd);
+
+      // Guardado seguro (NVS)
+      Serial.printf("🧮 Valores antes de guardar:\n");
+      Serial.printf("  ACCEL:  kp=%.3f ki=%.3f kd=%.3f\n", pidConfig.accel.kp, pidConfig.accel.ki, pidConfig.accel.kd);
+      Serial.printf("  ROLL_FB: kp=%.3f ki=%.3f kd=%.3f\n", pidConfig.roll_fb.kp, pidConfig.roll_fb.ki, pidConfig.roll_fb.kd);
+
+      savePID();
+
+      sendAckToGS(msgId);
+      Serial.println("✅ PID actualizado desde GS y guardado en NVS");
+
       return;
     }
 
@@ -1765,6 +1795,7 @@ void setup(){
   initMPU9250();
   calibrateIMU_Static();
   loadTrims();
+  loadPID();
   delay(1500);
 }
 
