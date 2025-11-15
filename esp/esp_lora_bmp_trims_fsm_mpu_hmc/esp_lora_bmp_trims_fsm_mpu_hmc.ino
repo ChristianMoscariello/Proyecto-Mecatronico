@@ -15,7 +15,8 @@
 #include <mpu9250.h>
 #include <eigen.h>
 #include <Wire.h>
-
+#include <Adafruit_Sensor.h>
+#include <Adafruit_HMC5883_U.h>
 
 // ============================================================================
 // 🛰️ CONFIGURACIÓN DE HARDWARE
@@ -35,7 +36,7 @@ bool bmp_ok = false;
 // --- LoRa ---
 #define LORA_CS 5
 #define LORA_RST 14
-#define LORA_IRQ 34
+#define LORA_IRQ 27
 #define LORA_BAND 433E6
 
 static const char* GS_HDR  = "GS#";
@@ -57,6 +58,8 @@ bool receivingJson = false;
 // --- IMU MPU9250 ---
 bfs::Mpu9250 mpu(&Wire, bfs::Mpu9250::I2C_ADDR_PRIM);
 bool mpuReady = false;
+Adafruit_HMC5883_Unified magExt = Adafruit_HMC5883_Unified(12345);
+bool magReady = false;
 
 // Estado angular
 unsigned long lastIMUUpdate = 0;
@@ -1108,9 +1111,22 @@ void handleLoRa(){
 }
 
 // ============================================================
-// 🔧 FUNCIONES IMU MPU9250
+// 🔧 FUNCIONES IMU MPU9250 + HMC5883L
 // ============================================================
 //-----Inicializacion-----
+void initHMC5883L() {
+  Serial.println("🔧 Inicializando magnetómetro externo HMC5883L...");
+
+  if (!magExt.begin()) {
+    Serial.println("❌ No se detectó HMC5883L");
+    magReady = false;
+    return;
+  }
+
+  Serial.println("✅ HMC5883L listo");
+  magReady = true;
+}
+
 void initMPU9250() {
   Serial.println("🔧 Inicializando MPU9250 (BolderFlight 5.6.0)...");
   Wire.begin();
@@ -1215,7 +1231,6 @@ float tiltCompensatedYaw(float rollDeg, float pitchDeg,
     return heading;
 }
 
-
 // --- Fusión yaw: compás + giro ---
 void fuseYaw(float gz, float dt, float yawMag)
 {
@@ -1235,35 +1250,39 @@ void fuseYaw(float gz, float dt, float yawMag)
     if (yaw_f >= 360) yaw_f -= 360;
 }
 
-
-// --- VERSION FINAL updateIMU ---
 void updateIMU() {
     if (!mpuReady) return;
     if (!mpu.Read()) return;
 
     static unsigned long last = millis();
-    float dt = (millis() - last) / 1000.0f;
+    float dt = (millis() - last) * 0.001f;
     last = millis();
 
-    // === 1. LECTURAS BRUTAS ===
+    // --- ACC + GYRO ---
     float ax = mpu.accel_x_mps2() - imuCal.accelBias[0];
     float ay = mpu.accel_y_mps2() - imuCal.accelBias[1];
     float az = mpu.accel_z_mps2() - imuCal.accelBias[2];
 
     float gx = mpu.gyro_x_radps() - imuCal.gyroBias[0];
-    float gy = mpu.gyro_y_radps() - imuCal.gyroBias[1];
+    float gy = mpu.gyro_x_radps() - imuCal.gyroBias[1];
     float gz = mpu.gyro_z_radps() - imuCal.gyroBias[2];
 
-    float mx_raw = mpu.mag_x_ut();
-    float my_raw = mpu.mag_y_ut();
-    float mz_raw = mpu.mag_z_ut();
+    // --- HMC5883L MAGNETÓMETRO EXTERNO ---
+    float mx_raw = 0, my_raw = 0, mz_raw = 0;
+    if (magReady) {
+        sensors_event_t ev;
+        magExt.getEvent(&ev);
+        mx_raw = ev.magnetic.x;
+        my_raw = ev.magnetic.y;
+        mz_raw = ev.magnetic.z;
+    }
 
-    // === 2. APLICAR TU CALIBRACIÓN MAGNÉTICA ===
+    // --- Aplicar tu calibración ---
     float mx = (mx_raw - imuCal.magBias[0]) * imuCal.magScale[0];
     float my = (my_raw - imuCal.magBias[1]) * imuCal.magScale[1];
     float mz = (mz_raw - imuCal.magBias[2]) * imuCal.magScale[2];
 
-    // === 3. FILTRO EMA ===
+    // --- Filtros EMA ---
     ax_f = (1 - ALPHA_ACC)  * ax_f + ALPHA_ACC  * ax;
     ay_f = (1 - ALPHA_ACC)  * ay_f + ALPHA_ACC  * ay;
     az_f = (1 - ALPHA_ACC)  * az_f + ALPHA_ACC  * az;
@@ -1276,18 +1295,19 @@ void updateIMU() {
     my_f = (1 - ALPHA_MAG) * my_f + ALPHA_MAG * my;
     mz_f = (1 - ALPHA_MAG) * mz_f + ALPHA_MAG * mz;
 
-    // === 4. CÁLCULO ANGULAR ===
+    // --- Roll / Pitch ---
     roll  = atan2f(ay_f, az_f) * RAD_TO_DEG;
     pitch = atan2f(-ax_f, sqrtf(ay_f*ay_f + az_f*az_f)) * RAD_TO_DEG;
 
-    // === 5. YAW con compensación de inclinación ===
+    // --- Yaw compensado ---
     yawMag = tiltCompensatedYaw(roll, pitch, mx_f, my_f, mz_f);
 
-    // === 6. FUSIÓN FINAL ===
+    // --- Fusión ---
     fuseYaw(gz_f, dt, yawMag);
+
+    // --- Debug ---
     printAttitude(roll, pitch, yaw_f, yawMag, yawGyro, mx_f, my_f, mz_f);
 }
-
 
 void printAttitude(float roll, float pitch, float yaw_f,float yawMag, float yawGyro, float mx, float my, float mz) {
   unsigned long now = millis();
@@ -1335,9 +1355,12 @@ void updateMagCalibrationPRO() {
   if (!magCalActivePRO) return;
   if (!mpu.Read()) return;
 
-  float mx = mpu.mag_x_ut();
-  float my = mpu.mag_y_ut();
-  float mz = mpu.mag_z_ut();
+  sensors_event_t ev;
+  magExt.getEvent(&ev);
+  float mx = ev.magnetic.x;
+  float my = ev.magnetic.y;
+  float mz = ev.magnetic.z;
+
 
   if (magCount < MAX_MAG_SAMPLES) {
     magBuff[magCount++] = { mx, my, mz };
@@ -1452,11 +1475,11 @@ void checkMagQualitySuggest() {
   if (millis() - lastChk < checkInterval) return;
   lastChk = millis();
 
-  // 🔹 Leer magnetómetro con BolderFlight
-  mpu.Read();
-  float mx = mpu.mag_x_ut();
-  float my = mpu.mag_y_ut();
-  float mz = mpu.mag_z_ut();
+  sensors_event_t ev;
+  magExt.getEvent(&ev);
+  float mx = ev.magnetic.x;
+  float my = ev.magnetic.y;
+  float mz = ev.magnetic.z;
 
   // 🔹 Magnitud del campo
   float magStrength = sqrtf(mx * mx + my * my + mz * mz);
@@ -1972,13 +1995,6 @@ void setup(){
   Serial.println("✅ UART0 (USB) OK");
   Serial.println("✅ UART2 (GPS) inicializado 9600 bps");
   Serial.println("✅ UART1 (RPI) inicializado 9600 bps");
-  Wire.begin();
-  Wire.beginTransmission(0x0D);
-  if (Wire.endTransmission() == 0) {
-    Serial.println("➡️ Sensor detectado: QMC5883L");
-  } else {
-    Serial.println("❌ No es QMC5883L, intentar HMC5883L (0x1E)");
-  }
 
 
   LoRa.setPins(LORA_CS,LORA_RST,LORA_IRQ);
@@ -1994,17 +2010,11 @@ void setup(){
   } else Serial.println("⚠️ BMP280 no encontrado");
 
   initMPU9250();
+  initHMC5883L();
   calibrateIMU_Static();
   loadTrims();
   loadPID();
   printMagCalibration();
-  Wire.begin();
-  Wire.beginTransmission(0x1E);
-  if (Wire.endTransmission() == 0) {
-    Serial.println("➡️ Sensor detectado: HMC5883L");
-  } else {
-    Serial.println("❌ No es QMC5883L, intentar HMC5883L (0x1E)");
-  }
   delay(1500);
 }
 
@@ -2030,7 +2040,9 @@ void loop(){
   //Serial.println("magupd");
   checkMagQualitySuggest();
  // Serial.println("magqua");
-
+  if (Serial.available()) {
+  char c = Serial.read();
+  if (c == 'M') testMagnetometerAK8963();
 }
 
-
+}
