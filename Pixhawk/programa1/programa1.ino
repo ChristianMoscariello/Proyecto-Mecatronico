@@ -6,37 +6,20 @@
 
 #include <SPI.h>
 #include <LoRa.h>
-#include <TinyGPS++.h>
 #include <ArduinoJson.h>
-#include <Adafruit_BMP280.h>
 #include <Preferences.h>
 #include <math.h>
-#include <units.h>
-#include <mpu9250.h>
-#include <eigen.h>
-#include <Wire.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_HMC5883_U.h>
-
+extern "C" {
+  #include <mavlink.h>
+}
 // ============================================================================
 // 🛰️ CONFIGURACIÓN DE HARDWARE
 // ============================================================================
 
-// --- GPS ---
-#define GPS_RX 16
-#define GPS_TX 17
-HardwareSerial SerialGPS(2);
-TinyGPSPlus gps;
-Preferences gpsPrefs;
-
-// --- BMP280 ---
-Adafruit_BMP280 bmp;
-bool bmp_ok = false;
-
 // --- LoRa ---
 #define LORA_CS 5
 #define LORA_RST 14
-#define LORA_IRQ 27
+#define LORA_IRQ 34
 #define LORA_BAND 433E6
 
 static const char* GS_HDR  = "GS#";
@@ -55,50 +38,11 @@ char rpiBuffer[RPI_BUFFER_SIZE];
 size_t rpiIndex = 0;
 bool receivingJson = false;
 
-// --- IMU MPU9250 ---
-bfs::Mpu9250 mpu(&Wire, bfs::Mpu9250::I2C_ADDR_PRIM);
-bool mpuReady = false;
-Adafruit_HMC5883_Unified magExt = Adafruit_HMC5883_Unified(12345);
-bool magReady = false;
-
-// Estado angular
-unsigned long lastIMUUpdate = 0;
-
-// → Ajuste de declinación magnética para Adrogué / Buenos Aires
-const float MAG_DECLINATION_DEG = -9.9f;
-unsigned long lastAttPrint = 0;
-const unsigned long ATT_PRINT_INTERVAL = 500; 
-
-// --- Filtros EMA (suavizado) ---
-#define ALPHA_ACC  0.15f
-#define ALPHA_GYRO 0.15f
-#define ALPHA_MAG  0.20f
-#define ALPHA_YAW  0.05f   // fusión: 0.05 = 95% giro + 5% compás
-
-// Variables filtradas globales
-float ax_f=0, ay_f=0, az_f=0;
-float gx_f=0, gy_f=0, gz_f=0;
-float mx_f=0, my_f=0, mz_f=0;
-
-// Salidas globales
-float roll=0, pitch=0, yaw_f=0;
-float yawGyro = 0;
-float yawMag = 0;
-
-// ========================================================
-//  🔧 CALIBRACIÓN MAGNÉTICA PRO (ellipsoid fitting)
-// ========================================================
-
-#define MAX_MAG_SAMPLES 1200   // hasta ~10 segundos
-struct MagSample {
-  float x, y, z;
-};
-
-MagSample magBuff[MAX_MAG_SAMPLES];
-int magCount = 0;
-bool magCalActivePRO = false;
-unsigned long magCalStartPRO = 0;
-unsigned long magCalDurationPRO = 0;
+// --- Pixhawk MAVLink (antes era el GPS externo) ---
+#define MAV_RX 16        // conectar a TX de TELEM2
+#define MAV_TX 17        // conectar a RX de TELEM2
+HardwareSerial SerialMAV(2);
+// YA NO usamos TinyGPS++ ni gpsPrefs: todo viene de Pixhawk
 
 
 // ============================================================
@@ -118,46 +62,23 @@ struct Mission {
   String event_action;
 } mission;
 
-struct MagAxis {
-  float minVal;
-  float maxVal;
-};
+// =======================
+// 🌐 Telemetría MAVLink
+// =======================
+bool mav_has_fix = false;
+double mav_lat = 0.0, mav_lon = 0.0;
+double mav_alt_rel = 0.0;           // altitud relativa en m
+double mav_ground_speed = 0.0;      // m/s
+double mav_heading_deg = 0.0;       // grados
+unsigned long mav_last_update_ms = 0;
 
-struct MagCalAxisData {
-  bool active;
-  unsigned long startMs;
-  unsigned long durationMs;
-  size_t samples;
-  MagAxis x, y, z;
-};
+// Reuso tus variables filtradas:
+extern double lat_f, lon_f, alt_f;  // ya están declaradas
+extern double alt_baro_f;           // la vamos a alimentar desde MAVLink
 
-MagCalAxisData magCal;
-
-String magQuality = "GOOD";
-struct IMUCalibration {
-  float accelBias[3];
-  float gyroBias[3];
-  float magBias[3];
-  float magScale[3];
-};
-
-// Variable global que contiene los datos actuales de calibración
-IMUCalibration imuCal;
-
-struct PIDParams {
-  float kp;
-  float ki;
-  float kd;
-};
-
-struct PIDSet {
-  PIDParams accel;
-  PIDParams roll_lr;
-  PIDParams roll_fb;
-  PIDParams rudder;
-};
-
-PIDSet pidConfig;   // configuración actual de PID
+// Heartbeat hacia Pixhawk
+unsigned long lastHeartbeatMs = 0;
+unsigned long insideRadiusSince = 0;
 
 // ============================================================
 // 🧭 Máquina de estados del dron
@@ -199,84 +120,6 @@ unsigned long missionStartTime = 0;
 bool simulationMode = false;
 
 // ============================================================================
-// ⚙️ CONFIGURACIÓN DE PREFS
-// ============================================================================
-Preferences prefs;
-struct TrimValues {
-  float accel   = 128.0;
-  float roll_lr = 128.0;
-  float roll_fb = 128.0;
-  float rudder  = 128.0;
-  float sw      = 128.0;
-} trims;
-
-void loadTrims() {
-  prefs.begin("drone", true);
-  trims.accel   = prefs.getFloat("accel", 128.0);
-  trims.roll_lr = prefs.getFloat("roll_lr", 128.0);
-  trims.roll_fb = prefs.getFloat("roll_fb", 128.0);
-  trims.rudder  = prefs.getFloat("rudder", 128.0);
-  trims.sw      = prefs.getFloat("switch", 128.0);
-  prefs.end();
-}
-
-void saveTrims() {
-  prefs.begin("drone", false);
-  prefs.putFloat("accel", trims.accel);
-  prefs.putFloat("roll_lr", trims.roll_lr);
-  prefs.putFloat("roll_fb", trims.roll_fb);
-  prefs.putFloat("rudder", trims.rudder);
-  prefs.putFloat("switch", trims.sw);
-  prefs.end();
-}
-
-void saveIMUCalibration() {
-  prefs.begin("mpu9250", false);
-  prefs.putBytes("accelBias", imuCal.accelBias, sizeof(imuCal.accelBias));
-  prefs.putBytes("gyroBias",  imuCal.gyroBias,  sizeof(imuCal.gyroBias));
-  prefs.putBytes("magBias",   imuCal.magBias,   sizeof(imuCal.magBias));
-  prefs.putBytes("magScale",  imuCal.magScale,  sizeof(imuCal.magScale));
-  prefs.end();
-  Serial.println("💾 Calibraciones IMU guardadas");
-}
-
-void loadIMUCalibration() {
-  prefs.begin("mpu9250", true);
-  prefs.getBytes("accelBias", imuCal.accelBias, sizeof(imuCal.accelBias));
-  prefs.getBytes("gyroBias",  imuCal.gyroBias,  sizeof(imuCal.gyroBias));
-  prefs.getBytes("magBias",   imuCal.magBias,   sizeof(imuCal.magBias));
-  prefs.getBytes("magScale",  imuCal.magScale,  sizeof(imuCal.magScale));
-  prefs.end();
-  Serial.println("📥 Calibraciones IMU cargadas");
-}
-
-void savePID() {
-  prefs.begin("pidConfig", false);
-  size_t written = prefs.putBytes("config", &pidConfig, sizeof(pidConfig));
-  prefs.end();
-  Serial.printf("💾 Guardado PID (%u bytes de %u)\n", written, sizeof(pidConfig));
-}
-
-void loadPID() {
-  prefs.begin("pidConfig", true);
-  size_t len = prefs.getBytes("config", &pidConfig, sizeof(pidConfig));
-  prefs.end();
-
-  if (len == sizeof(pidConfig)) {
-    Serial.println("📥 PID cargado desde NVS correctamente");
-  } else {
-    Serial.printf("⚠️ PID no encontrado (len=%u), cargando por defecto\n", len);
-    pidConfig.accel  = {1.0, 0.0, 0.0};
-    pidConfig.roll_lr = {1.0, 0.0, 0.0};
-    pidConfig.roll_fb = {1.0, 0.0, 0.0};
-    pidConfig.rudder = {1.0, 0.0, 0.0};
-    savePID();
-  }
-}
-
-
-
-// ============================================================================
 // 🔹 FUNCIONES DE UTILIDAD y geodesicas
 // ============================================================================
 unsigned long toUnixTime(int y,int m,int d,int h,int min,int s){
@@ -310,134 +153,142 @@ double computeBearing(double lat1, double lon1, double lat2, double lon2) {
   return fmod((rad2deg(brng) + 360.0), 360.0);
 }
 
-// ============================================================================
-// 🛰️ FILTROS GPS con fase de estabilización inicial
-// ============================================================================
-double lat_window[4] = {0}, lon_window[4] = {0}, alt_window[4] = {0};
-int win_idx = 0;
+// ============================================================
+// 🔧 FUNCIONES Mavlink
+// ============================================================
+// =======================
+// 📥 Lectura MAVLink
+// =======================
+void sendHeartbeatToPixhawk() {
+  mavlink_message_t msg;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
 
-double lat_f = 0.0, lon_f = 0.0, alt_f = 0.0;
-bool have_filter = false;
-int gpsWarmup = 0;                 // contador de estabilización
-const int GPS_WARMUP_COUNT = 10;   // lecturas antes de activar rechazo de saltos
-const double MAX_JUMP_DEG = 0.00030; // ≈33 m
+  mavlink_msg_heartbeat_pack(
+      42,                    // system_id del ESP32
+      199,                   // component_id
+      &msg,
+      MAV_TYPE_ONBOARD_CONTROLLER,
+      MAV_AUTOPILOT_INVALID,
+      0,                     // base_mode
+      0,                     // custom_mode
+      MAV_STATE_ACTIVE
+  );
 
-// --- Mediana de 4 valores ---
-double median4(double a, double b, double c, double d) {
-  double arr[4] = {a,b,c,d};
-  for (int i = 0; i < 3; i++)
-    for (int j = i + 1; j < 4; j++)
-      if (arr[j] < arr[i]) {
-        double t = arr[i]; arr[i] = arr[j]; arr[j] = t;
-      }
-  return (arr[1] + arr[2]) / 2.0;
+  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+  SerialMAV.write(buf, len);
 }
 
-// --- Filtro GPS con warm-up adaptativo ---
-void filterGPS(double lat, double lon, double alt,
-               double &lat_out, double &lon_out, double &alt_out) {
+void readMavlink() {
+  mavlink_message_t msg;
+  mavlink_status_t status;
 
-  if (fabs(lat) < 0.0001 && fabs(lon) < 0.0001)
-    return;  // coordenadas nulas, sin fix válido
+  while (SerialMAV.available()) {
+    uint8_t c = SerialMAV.read();
 
-  // Ventana circular
-  lat_window[win_idx] = lat;
-  lon_window[win_idx] = lon;
-  alt_window[win_idx] = alt;
-  win_idx = (win_idx + 1) % 4;
+    if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
+      switch (msg.msgid) {
 
-  double lat_m = median4(lat_window[0], lat_window[1], lat_window[2], lat_window[3]);
-  double lon_m = median4(lon_window[0], lon_window[1], lon_window[2], lon_window[3]);
+        case MAVLINK_MSG_ID_GLOBAL_POSITION_INT: {
+          mavlink_global_position_int_t pos;
+          mavlink_msg_global_position_int_decode(&msg, &pos);
 
-  if (!have_filter) {
-    lat_f = lat_m; lon_f = lon_m; alt_f = alt;
-    have_filter = true;
-    gpsWarmup = 0;
-    Serial.println("[GPS] 🆗 Filtro inicializado (modo warm-up)");
-  }
-  else {
-    gpsWarmup++;
+          double raw_lat = pos.lat / 1e7;
+          double raw_lon = pos.lon / 1e7;
+          double raw_alt = pos.relative_alt / 1000.0;  // m, relativo al home
 
-    // ► Warm-up adaptativo
-    if (gpsWarmup < 200) {  // máximo 200 lecturas (~200 s)
-      double dLat = fabs(lat_m - lat_f);
-      double dLon = fabs(lon_m - lon_f);
+          // Reuso tu filtro de GPS:
+          filterGPS(raw_lat, raw_lon, raw_alt, lat_f, lon_f, alt_f);
 
-      lat_f = 0.7 * lat_m + 0.3 * lat_f;
-      lon_f = 0.7 * lon_m + 0.3 * lon_f;
-      alt_f = 0.5 * alt + 0.5 * alt_f;
-
-      // cuando los saltos son pequeños por varias lecturas, termina warm-up
-      if (dLat < 0.00002 && dLon < 0.00002) {
-        static int stableCount = 0;
-        stableCount++;
-        if (stableCount >= 8) {  // 8 lecturas estables consecutivas
-          gpsWarmup = 9999;  // marca como completado
-          Serial.println("[GPS] ✅ Estabilización completada (automática)");
+          alt_baro_f   = alt_f;   // ahora la "altitud baro" viene del Pixhawk
+          mav_lat      = lat_f;
+          mav_lon      = lon_f;
+          mav_alt_rel  = alt_baro_f;
+          mav_has_fix  = true;
+          mav_last_update_ms = millis();
+          break;
         }
-      }
-    } else {
-      // ► Filtro normal con rechazo de saltos
-      if (fabs(lat_m - lat_f) > MAX_JUMP_DEG || fabs(lon_m - lon_f) > MAX_JUMP_DEG) {
-        Serial.println("[GPS] ⚠️ Salto grande descartado");
-        lat_out = lat_f; lon_out = lon_f; alt_out = alt_f;
-        return;
-      }
 
-      float spd_kmh = gps.speed.kmph();
-      double alpha = (spd_kmh < 5.0) ? 0.25 : 0.6;
-      lat_f = alpha * lat_m + (1.0 - alpha) * lat_f;
-      lon_f = alpha * lon_m + (1.0 - alpha) * lon_f;
-      alt_f = alpha * alt + (1.0 - alpha) * alt_f;
+        case MAVLINK_MSG_ID_VFR_HUD: {
+          mavlink_vfr_hud_t hud;
+          mavlink_msg_vfr_hud_decode(&msg, &hud);
+          mav_ground_speed = hud.groundspeed;   // m/s
+          mav_heading_deg  = hud.heading;       // grados
+          break;
+        }
+
+        default:
+          break;
+      }
     }
   }
-
-  lat_out = lat_f;
-  lon_out = lon_f;
-  alt_out = alt_f;
 }
 
+// ==================================================
+//  🚁 SET_MODE → GUIDED
+// ==================================================
+void setModeGuided() {
+  mavlink_message_t msg;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
 
-// ============================================================================
-// 🌡️ ALTITUD BAROMÉTRICA FILTRADA (BMP280)
-// ============================================================================
-static float QNH_hPa = 1013.25;
-static const float ALT_EMA_ALPHA = 0.25f;
-static const float ALT_MAX_STEP = 3.0f;
-static bool  alt_zero_set=false;
-static float alt_zero=0.0f, alt_baro_f=0.0f;
-static unsigned long lastAltMs=0;
-static float climb_mps=0.0f;
+  mavlink_msg_set_mode_pack(
+      42,
+      199,
+      &msg,
+      1,
+      MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+      4); // GUIDED
 
-void calibrateAltZero(int samples=60,int delay_ms=20){
-  float acc=0.0f; int ok=0;
-  for(int i=0;i<samples;i++){
-    if(!bmp_ok) break;
-    float v=bmp.readAltitude(QNH_hPa);
-    if(isfinite(v)){acc+=v;ok++;}
-    delay(delay_ms);
-  }
-  if(ok>0){
-    alt_zero=acc/ok; alt_baro_f=0.0f; alt_zero_set=true;
-    Serial.printf("[BARO] 🔧 Cero calibrado: %.2f m (%d muestras)\n",alt_zero,ok);
-  } else Serial.println("[BARO] ⚠️ No se pudo calibrar el cero");
+  SerialMAV.write(buf, mavlink_msg_to_send_buffer(buf, &msg));
 }
 
-void updateAltitudeBaro(){
-  if(!bmp_ok||!alt_zero_set) return;
-  float newAlt=bmp.readAltitude(QNH_hPa);
-  if(!isfinite(newAlt)) return;
-  float rel=newAlt-alt_zero;
-  float step=fabsf(rel-alt_baro_f);
-  if(step>ALT_MAX_STEP){Serial.printf("[BARO] ⚠️ Pico descartado (Δ=%.2f)\n",step);return;}
-  alt_baro_f = ALT_EMA_ALPHA*rel + (1.0f-ALT_EMA_ALPHA)*alt_baro_f;
-  static float prev=0.0f;
-  unsigned long now=millis();
-  if(lastAltMs!=0){
-    float dt=(now-lastAltMs)/1000.0f;
-    if(dt>0.001f) climb_mps=(alt_baro_f-prev)/dt;
-  }
-  prev=alt_baro_f; lastAltMs=now;
+// ==================================================
+//  🚁 ARM / DISARM
+// ==================================================
+void pixhawkArm(bool arm) {
+  mavlink_message_t msg;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+  mavlink_msg_command_long_pack(
+      42,
+      199,
+      &msg,
+      1, 0,
+      MAV_CMD_COMPONENT_ARM_DISARM,
+      0,
+      arm ? 1.0 : 0.0,
+      0,0,0,0,0,0);
+
+  SerialMAV.write(buf, mavlink_msg_to_send_buffer(buf, &msg));
+}
+
+// ==================================================
+//  🚁 GOTO (SET_POSITION_TARGET_GLOBAL_INT)
+// ==================================================
+void sendGotoPixhawk(const Coordinate &target) {
+  mavlink_message_t msg;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+  uint16_t type_mask =
+      (1 << 3) | (1 << 4) | (1 << 5) |
+      (1 << 6) | (1 << 7) | (1 << 8) |
+      (1 << 9) | (1 << 10);
+
+  mavlink_msg_set_position_target_global_int_pack(
+      42,
+      199,
+      &msg,
+      millis(),
+      1, 1,
+      MAV_FRAME_GLOBAL_RELATIVE_ALT,
+      type_mask,
+      (int32_t)(target.lat * 1e7),
+      (int32_t)(target.lon * 1e7),
+      mission.altitude,
+      0, 0, 0,
+      0, 0, 0,
+      0, 0);
+
+  SerialMAV.write(buf, mavlink_msg_to_send_buffer(buf, &msg));
 }
 
 // ============================================================================
@@ -842,9 +693,11 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
     }
 
     else if (strcmp(type, "ARM") == 0) {
-      Serial.println("🚁 ARM recibido");
-      if (bmp_ok) { calibrateAltZero(60, 20); }
-      zeroGyroOnARM();
+      setModeGuided();
+      delay(300);
+      pixhawkArm(true);
+      state = WAITING_MISSION;
+      Serial.println("Pixhawk ARM + GUIDED enviado");
       sendAckToGS(msgId);
       return;
     }
@@ -873,13 +726,6 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       simulationMode = false;
       Serial.println("🛑 Modo SIMULACIÓN DESACTIVADO");
       sendAckToGS(msgId);
-      return;
-    }
-
-    else if (strcmp(type, "CALIB_MAG") == 0) {
-      Serial.println("🧭 CALIB_MAG recibido desde GS");
-      startMagCalibrationPRO(30000);    // 30 s
-      sendAckToGS(doc["id"] | "");   // si usás ACK
       return;
     }
 
@@ -972,11 +818,7 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
     else if (doc.containsKey("d") && doc["d"].containsKey("confidence"))
       confidence = doc["d"]["confidence"];
 
-    if (gps.date.isValid() && gps.time.isValid()) {
-      ts = toUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
-                      gps.time.hour(), gps.time.minute(), gps.time.second());
-    }
-    sendEventToGS(type, lat_f, lon_f, alt_f, ts, confidence);
+    sendEventToGS(type, mav_lat, mav_lon, mav_alt_rel, ts, confidence);
     return;
   }
 
@@ -989,12 +831,7 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
     if (doc.containsKey("confidence")) confidence = doc["confidence"];
     else if (doc.containsKey("d") && doc["d"].containsKey("confidence"))
       confidence = doc["d"]["confidence"];
-
-    if (gps.date.isValid() && gps.time.isValid()) {
-      ts = toUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
-                      gps.time.hour(), gps.time.minute(), gps.time.second());
-    }
-    sendEventToGS(type, lat_f, lon_f, alt_f, ts, confidence);
+    sendEventToGS(type, mav_lat, mav_lon, mav_alt_rel, ts, confidence);
     return;
   }
 
@@ -1003,36 +840,33 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
 // ============================================================================
 // 🔄 MANEJO DE SENSORES Y COMUNICACIONES
 // ============================================================================
-void updateGPS(){
-  while(SerialGPS.available()){gps.encode(SerialGPS.read());}
-}
 
 void handleTelemetry() {
   static unsigned long lastTelemetryTime = 0;
   if (millis() - lastTelemetryTime >= 1000) {
 
-    if (!simulationMode) {
-      updateAltitudeBaro();
-      if (gps.location.isValid()) {
-        double lat, lon, alt_dum;
-        filterGPS(gps.location.lat(), gps.location.lng(),
-                  gps.altitude.meters(), lat, lon, alt_dum);
-        unsigned long ts = 0;
-        if (gps.date.isValid() && gps.time.isValid()) {
-          ts = toUnixTime(gps.date.year(), gps.date.month(), gps.date.day(),
-                          gps.time.hour(), gps.time.minute(), gps.time.second());
-        }
-        sendTelemetry(lat, lon, alt_baro_f, gps.speed.kmph(), gps.course.deg(), ts);
-      }
-    } else {
-      // 🔹 En modo simulación, enviar posición virtual
+    if (!simulationMode && mav_has_fix) {
+      double lat     = mav_lat;
+      double lon     = mav_lon;
+      double alt     = mav_alt_rel;                  // relativa al home
+      double speed_k = mav_ground_speed * 3.6;       // km/h
+      double heading = mav_heading_deg;
+      unsigned long ts = millis();                   // o podés mandar boot_ms
+
+      sendTelemetry(lat, lon, alt, speed_k, heading, ts);
+    }
+    else if (simulationMode) {
+      // Si querés seguir probando sin Pixhawk, podés mantener esto
+      double lat = lat_f;
+      double lon = lon_f;
       unsigned long ts = millis();
-      sendTelemetry(lat_f, lon_f, alt_baro_f, 5.0, 0.0, ts);
+      sendTelemetry(lat, lon, alt_baro_f, 5.0, 0.0, ts);
     }
 
     lastTelemetryTime = millis();
   }
 }
+
 
 
 // ============================================================================
@@ -1091,8 +925,9 @@ void handleSerialRPI() {
 void sendStableToRPi(const Coordinate &pos) {
   StaticJsonDocument<128> doc;
   doc["t"] = "STABLE";
-  doc["lat"] = pos.lat;
-  doc["lon"] = pos.lon;
+  doc["lat"] = mav_lat;
+  doc["lon"] = mav_lon;
+  doc["alt"] = mav_alt_rel;
   doc["ts"] = millis();
 
   String payload;
@@ -1111,430 +946,18 @@ void handleLoRa(){
 }
 
 // ============================================================
-// 🔧 FUNCIONES IMU MPU9250 + HMC5883L
-// ============================================================
-//-----Inicializacion-----
-void initHMC5883L() {
-  Serial.println("🔧 Inicializando magnetómetro externo HMC5883L...");
-
-  if (!magExt.begin()) {
-    Serial.println("❌ No se detectó HMC5883L");
-    magReady = false;
-    return;
-  }
-
-  Serial.println("✅ HMC5883L listo");
-  magReady = true;
-}
-
-void initMPU9250() {
-  Serial.println("🔧 Inicializando MPU9250 (BolderFlight 5.6.0)...");
-  Wire.begin();
-
-  if (!mpu.Begin()) {
-    Serial.println("❌ Error iniciando MPU9250");
-    mpuReady = false;
-    return;
-  }
-
-  mpu.ConfigAccelRange(bfs::Mpu9250::ACCEL_RANGE_4G);
-  mpu.ConfigGyroRange(bfs::Mpu9250::GYRO_RANGE_500DPS);
-  mpu.ConfigDlpfBandwidth(bfs::Mpu9250::DLPF_BANDWIDTH_41HZ);
-  mpu.ConfigSrd(19);
-
-  loadIMUCalibration();
-  mpuReady = true;
-  Serial.println("✅ MPU9250 listo");
-}
-
-//----Calibración estática-------
-void calibrateIMU_Static() {
-  if (!mpuReady) return;
-  Serial.println("🧪 Calibración estática (ACC + GYRO) — mantener el dron quieto y nivelado...");
-
-  const int N = 500;
-  double ax_sum = 0, ay_sum = 0, az_sum = 0;
-  double gx_sum = 0, gy_sum = 0, gz_sum = 0;
-
-  for (int i = 0; i < N; i++) {
-    if (mpu.Read()) {
-      ax_sum += mpu.accel_x_mps2();
-      ay_sum += mpu.accel_y_mps2();
-      az_sum += mpu.accel_z_mps2();
-      gx_sum += mpu.gyro_x_radps();
-      gy_sum += mpu.gyro_y_radps();
-      gz_sum += mpu.gyro_z_radps();
-    }
-    delay(20);
-  }
-
-  // Promedio y compensación de gravedad
-  imuCal.accelBias[0] = ax_sum / N;
-  imuCal.accelBias[1] = ay_sum / N;
-  imuCal.accelBias[2] = (az_sum / N) - 9.80665;  // quitar gravedad
-  imuCal.gyroBias[0] = gx_sum / N;
-  imuCal.gyroBias[1] = gy_sum / N;
-  imuCal.gyroBias[2] = gz_sum / N;
-
-  saveIMUCalibration();
-  loadIMUCalibration();
-
-  Serial.println("✅ Calibración ACC + GYRO completada y guardada");
-}
-
-//----Zero Gyro en ARM----
-void zeroGyroOnARM() {
-  if (!mpuReady) return;
-  Serial.println("🟢 Re-zero GYRO en ARM — dron quieto");
-
-  const int N = 200;
-  double gx_sum = 0, gy_sum = 0, gz_sum = 0;
-
-  for (int i = 0; i < N; i++) {
-    if (mpu.Read()) {
-      gx_sum += mpu.gyro_x_radps();
-      gy_sum += mpu.gyro_y_radps();
-      gz_sum += mpu.gyro_z_radps();
-    }
-    delay(5);
-  }
-
-  imuCal.gyroBias[0] = gx_sum / N;
-  imuCal.gyroBias[1] = gy_sum / N;
-  imuCal.gyroBias[2] = gz_sum / N;
-
-  saveIMUCalibration();
-  loadIMUCalibration();
-
-  Serial.println("✅ Gyros re-centrados en ARM");
-}
-
-// ============================================================
-// 🔥 VERSION DEFINITIVA DE updateIMU() + FUSIONES + TILT COMP.
-// ============================================================
-// --- compensación de inclinación ---
-float tiltCompensatedYaw(float rollDeg, float pitchDeg,
-                         float mx, float my, float mz)
-{
-    float roll  = rollDeg  * DEG_TO_RAD;
-    float pitch = pitchDeg * DEG_TO_RAD;
-
-    float sinR = sinf(roll),  cosR = cosf(roll);
-    float sinP = sinf(pitch), cosP = cosf(pitch);
-
-    // Rotación clásica
-    float mx_c = mx * cosP + mz * sinP;
-    float my_c = mx * sinR * sinP + my * cosR - mz * sinR * cosP;
-
-    float heading = atan2f(-my_c, mx_c) * RAD_TO_DEG;
-    if (heading < 0) heading += 360.0f;
-    return heading;
-}
-
-// --- Fusión yaw: compás + giro ---
-void fuseYaw(float gz, float dt, float yawMag)
-{
-    yawGyro = 0;
-
-    // Integración giroscopio
-    yawGyro += gz * RAD_TO_DEG * dt;
-    if (yawGyro < 0) yawGyro += 360;
-    if (yawGyro >= 360) yawGyro -= 360;
-
-    // Complementario
-    yawGyro = (1 - ALPHA_YAW) * yawGyro + ALPHA_YAW * yawMag;
-
-    // Corrección declinación
-    yaw_f = yawGyro + MAG_DECLINATION_DEG;
-    if (yaw_f < 0) yaw_f += 360;
-    if (yaw_f >= 360) yaw_f -= 360;
-}
-
-void updateIMU() {
-    if (!mpuReady) return;
-    if (!mpu.Read()) return;
-
-    static unsigned long last = millis();
-    float dt = (millis() - last) * 0.001f;
-    last = millis();
-
-    // --- ACC + GYRO ---
-    float ax = mpu.accel_x_mps2() - imuCal.accelBias[0];
-    float ay = mpu.accel_y_mps2() - imuCal.accelBias[1];
-    float az = mpu.accel_z_mps2() - imuCal.accelBias[2];
-
-    float gx = mpu.gyro_x_radps() - imuCal.gyroBias[0];
-    float gy = mpu.gyro_x_radps() - imuCal.gyroBias[1];
-    float gz = mpu.gyro_z_radps() - imuCal.gyroBias[2];
-
-    // --- HMC5883L MAGNETÓMETRO EXTERNO ---
-    float mx_raw = 0, my_raw = 0, mz_raw = 0;
-    if (magReady) {
-        sensors_event_t ev;
-        magExt.getEvent(&ev);
-        mx_raw = ev.magnetic.x;
-        my_raw = ev.magnetic.y;
-        mz_raw = ev.magnetic.z;
-    }
-
-    // --- Aplicar tu calibración ---
-    float mx = (mx_raw - imuCal.magBias[0]) * imuCal.magScale[0];
-    float my = (my_raw - imuCal.magBias[1]) * imuCal.magScale[1];
-    float mz = (mz_raw - imuCal.magBias[2]) * imuCal.magScale[2];
-
-    // --- Filtros EMA ---
-    ax_f = (1 - ALPHA_ACC)  * ax_f + ALPHA_ACC  * ax;
-    ay_f = (1 - ALPHA_ACC)  * ay_f + ALPHA_ACC  * ay;
-    az_f = (1 - ALPHA_ACC)  * az_f + ALPHA_ACC  * az;
-
-    gx_f = (1 - ALPHA_GYRO) * gx_f + ALPHA_GYRO * gx;
-    gy_f = (1 - ALPHA_GYRO) * gy_f + ALPHA_GYRO * gy;
-    gz_f = (1 - ALPHA_GYRO) * gz_f + ALPHA_GYRO * gz;
-
-    mx_f = (1 - ALPHA_MAG) * mx_f + ALPHA_MAG * mx;
-    my_f = (1 - ALPHA_MAG) * my_f + ALPHA_MAG * my;
-    mz_f = (1 - ALPHA_MAG) * mz_f + ALPHA_MAG * mz;
-
-    // --- Roll / Pitch ---
-    roll  = atan2f(ay_f, az_f) * RAD_TO_DEG;
-    pitch = atan2f(-ax_f, sqrtf(ay_f*ay_f + az_f*az_f)) * RAD_TO_DEG;
-
-    // --- Yaw compensado ---
-    yawMag = tiltCompensatedYaw(roll, pitch, mx_f, my_f, mz_f);
-
-    // --- Fusión ---
-    fuseYaw(gz_f, dt, yawMag);
-
-    // --- Debug ---
-    printAttitude(roll, pitch, yaw_f, yawMag, yawGyro, mx_f, my_f, mz_f);
-}
-
-void printAttitude(float roll, float pitch, float yaw_f,float yawMag, float yawGyro, float mx, float my, float mz) {
-  unsigned long now = millis();
-  if (now - lastAttPrint < ATT_PRINT_INTERVAL) return;
-  lastAttPrint = now;
-  float magStrength = sqrtf(mx*mx + my*my + mz*mz);
-
-  Serial.printf("\n===== ATTITUDE DEBUG =====\n");
-  Serial.printf("Roll:  %.2f°\n", roll);
-  Serial.printf("Pitch: %.2f°\n", pitch);
-  Serial.printf("Yaw:   %.2f°\n", yaw_f);
-  Serial.printf("Yawmag:   %.2f°\n", yawMag);
-  Serial.printf("Yawgyro:   %.2f°\n", yawGyro);
-  Serial.printf("Mag:   %.2f uT\n", magStrength);
-  Serial.printf("Mx:   %.2f ", mx);
-  Serial.printf("My:   %.2f ", my);
-  Serial.printf("Mz:   %.2f \n", mz);
-}
-
-
-//----Calibración magnética dinámica----
-
-void startMagCalibrationPRO(unsigned long durationMs) {
-  if (!mpuReady) return;
-
-  magCalActivePRO = true;
-  magCount = 0;
-  magCalStartPRO = millis();
-  magCalDurationPRO = durationMs;
-
-  Serial.println("🧭 [MAG PRO] Iniciando calibración 3D — rotar en todas las direcciones");
-
-  // Aviso a la GS (mismo formato)
-  StaticJsonDocument<192> j;
-  j["t"] = "MAG_CAL_PROGRESS";
-  JsonObject d = j.createNestedObject("d");
-  d["phase"] = "START_3D";
-  d["duration_ms"] = (int)durationMs;
-  j["ts"] = (int)millis();
-  sendJsonNoAckToGS(j);
-}
-
-
-void updateMagCalibrationPRO() {
-  if (!magCalActivePRO) return;
-  if (!mpu.Read()) return;
-
-  sensors_event_t ev;
-  magExt.getEvent(&ev);
-  float mx = ev.magnetic.x;
-  float my = ev.magnetic.y;
-  float mz = ev.magnetic.z;
-
-
-  if (magCount < MAX_MAG_SAMPLES) {
-    magBuff[magCount++] = { mx, my, mz };
-  }
-
-  // Reporte de progreso cada 2s
-  static unsigned long lastP = 0;
-  if (millis() - lastP > 2000) {
-    lastP = millis();
-    StaticJsonDocument<192> j;
-    j["t"] = "MAG_CAL_PROGRESS";
-    JsonObject d = j.createNestedObject("d");
-    d["phase"] = "RUN_3D";
-    d["samples"] = magCount;
-    d["elapsed"] = (int)(millis() - magCalStartPRO);
-    j["ts"] = (int)millis();
-    sendJsonNoAckToGS(j);
-  }
-
-  // FIN → procesar
-  if (millis() - magCalStartPRO > magCalDurationPRO) {
-    magCalActivePRO = false;
-    computeMagCalibrationPRO();
-  }
-}
-
-
-void computeMagCalibrationPRO() {
-  Serial.printf("📊 [MAG PRO] Procesando %d muestras...\n", magCount);
-
-  if (magCount < 200) {
-    Serial.println("❌ No hay suficientes muestras para calibración 3D");
-    return;
-  }
-
-  // 1 — Calcular bias simple (promedio min/max)
-  float minX = 1e6, minY = 1e6, minZ = 1e6;
-  float maxX = -1e6, maxY = -1e6, maxZ = -1e6;
-
-  for (int i = 0; i < magCount; i++) {
-    minX = min(minX, magBuff[i].x);
-    minY = min(minY, magBuff[i].y);
-    minZ = min(minZ, magBuff[i].z);
-
-    maxX = max(maxX, magBuff[i].x);
-    maxY = max(maxY, magBuff[i].y);
-    maxZ = max(maxZ, magBuff[i].z);
-  }
-
-  float bx = (maxX + minX) * 0.5f;
-  float by = (maxY + minY) * 0.5f;
-  float bz = (maxZ + minZ) * 0.5f;
-
-  // 2 — Soft iron (diagonal, simple)
-  float rangeX = maxX - minX;
-  float rangeY = maxY - minY;
-  float rangeZ = maxZ - minZ;
-  float avgRange = (rangeX + rangeY + rangeZ) / 3.0f;
-
-  float sx = avgRange / rangeX;
-  float sy = avgRange / rangeY;
-  float sz = avgRange / rangeZ;
-
-  // GUARDAR en tu struct existente (NO SE ROMPE NADA)
-  imuCal.magBias[0] = bx;
-  imuCal.magBias[1] = by;
-  imuCal.magBias[2] = bz;
-
-  imuCal.magScale[0] = sx;
-  imuCal.magScale[1] = sy;
-  imuCal.magScale[2] = sz;
-
-  saveIMUCalibration();
-
-  Serial.printf("✅ [MAG PRO] Bias(%.3f, %.3f, %.3f)\n", bx, by, bz);
-  Serial.printf("   Scale(%.3f, %.3f, %.3f)\n", sx, sy, sz);
-
-  // Enviar a GS igual que antes
-  StaticJsonDocument<256> j;
-  j["t"] = "MAG_CAL_RESULT";
-  JsonObject d = j.createNestedObject("d");
-
-  JsonObject bias = d.createNestedObject("bias");
-  bias["x"] = bx;  bias["y"] = by;  bias["z"] = bz;
-
-  JsonObject scale = d.createNestedObject("scale");
-  scale["x"] = sx;  scale["y"] = sy;  scale["z"] = sz;
-
-  d["samples"] = magCount;
-  d["result"] = "OK_3D";
-
-  j["ts"] = (int)millis();
-  sendJsonNoAckToGS(j);
-
-  printMagCalibration();
-}
-
-
-//----Chequeo de calidad magnética----
-void checkMagQualitySuggest() {
-  static unsigned long lastChk = 0;
-  static int badCount = 0;
-  static unsigned long lastBadTime = 0;
-
-  const int badThreshold = 3;
-  const unsigned long checkInterval = 3000;   // cada 3 s
-  const unsigned long decayInterval = 60000;  // 1 min reinicio contador
-  const float MAG_FIELD_REF_uT = 50.0f;       // campo terrestre típico
-  const float MAG_RECAL_THRESH = 0.35f;       // 35 % de desviación → alerta
-
-  if (!mpuReady) return;
-  if (millis() - lastChk < checkInterval) return;
-  lastChk = millis();
-
-  sensors_event_t ev;
-  magExt.getEvent(&ev);
-  float mx = ev.magnetic.x;
-  float my = ev.magnetic.y;
-  float mz = ev.magnetic.z;
-
-  // 🔹 Magnitud del campo
-  float magStrength = sqrtf(mx * mx + my * my + mz * mz);
-
-  // 🔹 Desviación relativa respecto del campo de referencia
-  float deviation = fabsf(magStrength - MAG_FIELD_REF_uT) / MAG_FIELD_REF_uT;
-
-  // 🔹 Reinicio de contador si pasó mucho tiempo
-  if (millis() - lastBadTime > decayInterval) badCount = 0;
-
-  // 🔹 Actualizar contador de desviaciones persistentes
-  if (deviation > MAG_RECAL_THRESH) {
-    badCount++;
-    lastBadTime = millis();
-  } else {
-    badCount = 0;
-  }
-
-  // 🔹 Determinar calidad magnética general
-  String magQuality;
-  if (deviation < 0.15f)      magQuality = "GOOD";
-  else if (deviation < 0.35f) magQuality = "WARN";
-  else                        magQuality = "BAD";
-
-  // 🔹 Reporte de estado a la Ground Station
-  /*StaticJsonDocument<192> jstatus;
-  jstatus["t"] = "MAG_STATUS";
-  JsonObject d = jstatus.createNestedObject("d");
-  d["quality"] = magQuality;
-  d["deviation"] = deviation;
-  d["field"] = magStrength;
-  jstatus["ts"] = (int)millis();
-  sendJsonNoAckToGS(jstatus); */
-
-  // 🔹 Enviar alerta si el error es persistente
-  if (badCount >= badThreshold && !magCal.active) {
-    badCount = 0;
-
-    StaticJsonDocument<192> jalert;
-    jalert["t"] = "MAG_RECAL_SUGGEST";
-    JsonObject da = jalert.createNestedObject("d");
-    da["deviation"] = deviation;
-    da["quality"] = magQuality;
-    da["hint"] = "Campo magnético inestable. Ejecute calibración dinámica.";
-    jalert["ts"] = (int)millis();
-
-    sendJsonNoAckToGS(jalert);
-    Serial.printf("⚠️ [MAG] Desviación persistente (%.2f) → sugerir recalibración\n", deviation);
-  }
-}
-
-
-// ============================================================
 // Funciones navegacion
 // ============================================================
+void navigateTo(const Coordinate& target) {
+  double dist    = haversineDistance(lat_f, lon_f, target.lat, target.lon);
+  double bearing = computeBearing(lat_f, lon_f, target.lat, target.lon);
+
+  Serial.printf("🧭 NAV (Pixhawk) → bearing=%.1f°, dist=%.1f m (lat=%.6f, lon=%.6f → %.6f, %.6f)\n",
+                bearing, dist, lat_f, lon_f, target.lat, target.lon);
+
+  // En lugar de simular movimiento, mandamos el goto al Pixhawk
+  sendGotoPixhawk(target);
+}
 
 void generateMissionPath(Mission& m) {
   pathPoints.clear();
@@ -1560,20 +983,6 @@ void generateMissionPath(Mission& m) {
                 (int)pathPoints.size(), m.spacing, totalDist);
 }
 
-void navigateTo(const Coordinate& target) {
-  double bearing = computeBearing(lat_f, lon_f, target.lat, target.lon);
-  double dist = haversineDistance(lat_f, lon_f, target.lat, target.lon);
-
-  Serial.printf("🧭 NAV → bearing=%.1f°, dist=%.1f m (lat=%.6f, lon=%.6f → %.6f, %.6f)\n",
-                bearing, dist, lat_f, lon_f, target.lat, target.lon);
-
-  // 🧩 Simulación: mover el dron una fracción hacia el destino
-  if (dist > 0.3) { // solo si queda distancia
-    double stepFrac = 0.05; // 5 % de avance por ciclo (~20 iteraciones por tramo)
-    lat_f += (target.lat - lat_f) * stepFrac;
-    lon_f += (target.lon - lon_f) * stepFrac;
-  }
-}
 
 // ============================================================
 // Máquina de estados para vuelo
@@ -1593,26 +1002,26 @@ void updateStateMachine() {
       }
       break;
 
-    case NAVIGATE:
-      if (currentWaypoint >= pathPoints.size()) {
-        Serial.println("🏁 Fin del recorrido → Retorno a HOME");
-        state = RETURN_HOME;
-        break;
-      }
+    case NAVIGATE: 
 
-      {
         Coordinate target = pathPoints[currentWaypoint];
         double dist = haversineDistance(lat_f, lon_f, target.lat, target.lon);
 
-        if (dist < 2.0) {
-          Serial.printf("📍 Waypoint %d alcanzado\n", currentWaypoint);
-          sendStableToRPi(target);
-          state = STABILIZE;
-          stateEntryTime = millis();
+        bool close_enough = dist < 3.0;
+        bool slow_enough  = mav_ground_speed < 0.5;
+
+        if (close_enough && slow_enough) {
+
+            if (millis() - insideRadiusSince > 1500) {
+                Serial.println("WAYPOINT REACHED ✔");
+                state = STABILIZE;
+                sendRPINotification("WAYPOINT_REACHED");
+                return;
+            }
         } else {
-          navigateTo(target); // TODO: función PWM + orientación
+            insideRadiusSince = millis();
+            sendGotoPixhawk(target);  // Reenvía orden si hace falta
         }
-      }
       break;
 
     case STABILIZE:
@@ -1855,194 +1264,40 @@ void simulateDroneMotion() {
       break;
   }
 }
-// ============================================================
-// 📡 IMPRIMIR CALIBRACIÓN MAGNÉTICA ACTUAL
-// ============================================================
-void printMagCalibration() {
-  Serial.println("===============================================");
-  Serial.println("🔍 Estado actual de calibración del magnetómetro");
-  Serial.println("===============================================");
-
-  Serial.printf("Bias (hard-iron):\n");
-  Serial.printf("   X: %.3f uT\n", imuCal.magBias[0]);
-  Serial.printf("   Y: %.3f uT\n", imuCal.magBias[1]);
-  Serial.printf("   Z: %.3f uT\n", imuCal.magBias[2]);
-
-  Serial.println();
-
-  Serial.printf("Scale (soft-iron):\n");
-  Serial.printf("   X: %.4f\n", imuCal.magScale[0]);
-  Serial.printf("   Y: %.4f\n", imuCal.magScale[1]);
-  Serial.printf("   Z: %.4f\n", imuCal.magScale[2]);
-
-  Serial.println();
-
-  Serial.printf("Declinación magnética aplicada: %.2f°\n", MAG_DECLINATION_DEG);
-
-  Serial.println("-----------------------------------------------");
-
-  // Opcional: imprimir fuerza del campo corregido (debug)
-  float mx = (mpu.mag_x_ut() - imuCal.magBias[0]) * imuCal.magScale[0];
-  float my = (mpu.mag_y_ut() - imuCal.magBias[1]) * imuCal.magScale[1];
-  float mz = (mpu.mag_z_ut() - imuCal.magBias[2]) * imuCal.magScale[2];
-
-  float magStrength = sqrtf(mx*mx + my*my + mz*mz);
-
-  Serial.printf("Campo magnético corregido: %.2f uT\n", magStrength);
-  Serial.println(" (valor típico entre 45 y 60 uT según región)");
-  
-  Serial.println("===============================================");
-}
-
-void testMagnetometerAK8963() {
-  if (!mpuReady) {
-    Serial.println("❌ MPU no inicializado");
-    return;
-  }
-
-  Serial.println("\n🔍 TEST DIAGNÓSTICO DEL MAGNETÓMETRO (AK8963)");
-  Serial.println("================================================");
-
-  const int N = 600;   // 600 muestras (~5-6 segundos)
-  float mx_min =  1e6, my_min =  1e6, mz_min =  1e6;
-  float mx_max = -1e6, my_max = -1e6, mz_max = -1e6;
-
-  Serial.println("👉 Mové el sensor en círculos amplios, roll/pitch/yaw…");
-
-  unsigned long start = millis();
-  while (millis() - start < 6000) {   // 6 segundos
-    if (mpu.Read()) {
-      float mx = mpu.mag_x_ut();
-      float my = mpu.mag_y_ut();
-      float mz = mpu.mag_z_ut();
-
-      mx_min = fminf(mx_min, mx);
-      my_min = fminf(my_min, my);
-      mz_min = fminf(mz_min, mz);
-
-      mx_max = fmaxf(mx_max, mx);
-      my_max = fmaxf(my_max, my);
-      mz_max = fmaxf(mz_max, mz);
-    }
-    delay(5);
-  }
-
-  // Resultados crudos
-  float rx = mx_max - mx_min;
-  float ry = my_max - my_min;
-  float rz = mz_max - mz_min;
-
-  Serial.println("\n📊 Rangos detectados (sin calibración):");
-  Serial.printf("   X: %.2f uT\n", rx);
-  Serial.printf("   Y: %.2f uT\n", ry);
-  Serial.printf("   Z: %.2f uT\n", rz);
-
-  // Campo estimado según movimientos
-  float avgRange = (rx + ry + rz) / 3.0f;
-
-  // Magnitud típica en Buenos Aires
-  const float EARTH_MIN = 22.0;
-  const float EARTH_MAX = 30.0;
-
-  Serial.println("\n📌 Análisis del estado del magnetómetro:");
-  bool damagedZ = false;
-
-  // --- Diagnóstico por rangos ---
-  if (rx < 8 || ry < 8) {
-    Serial.println("⚠️  Problema: Movimiento detectado MUY bajo en X o Y → magnetómetro rígido o interferido.");
-  }
-
-  if (rz < 6) {
-    Serial.println("❌ Eje Z casi inmóvil → posible daño en AK8963 o interferencia muy fuerte.");
-    damagedZ = true;
-  }
-
-  // --- Desbalance ---
-  float imbalanceXY = fabsf(rx - ry);
-  float imbalanceXZ = fabsf(rx - rz);
-  float imbalanceYZ = fabsf(ry - rz);
-
-  Serial.printf("   Desbalance X-Y: %.2f uT\n", imbalanceXY);
-  Serial.printf("   Desbalance X-Z: %.2f uT\n", imbalanceXZ);
-  Serial.printf("   Desbalance Y-Z: %.2f uT\n", imbalanceYZ);
-
-  // --- Interpretación ---
-  Serial.println("\n🧠 Diagnóstico final:");
-
-  if (damagedZ) {
-    Serial.println("❌ **El eje Z parece DAÑADO** (casi no varía).");
-  } else if (avgRange < 10) {
-    Serial.println("⚠️ **Rango total bajo** → magnetómetro muy interferido.");
-  } else if (imbalanceXZ > 20 || imbalanceYZ > 20) {
-    Serial.println("⚠️ **Desbalance fuerte entre ejes** → interferencia fija o hard-iron externo.");
-  } else {
-    Serial.println("✅ **Magnetómetro OK** — rangos normales.");
-  }
-
-  Serial.println("================================================\n");
-}
-
 
 // ============================================================================
 // 🚀 SETUP Y LOOP PRINCIPALES
 // ============================================================================
 void setup(){
   Serial.begin(115200);
-  SerialGPS.begin(9600,SERIAL_8N1,GPS_RX,GPS_TX);
+  SerialMAV.begin(57600, SERIAL_8N1, MAV_RX, MAV_TX);
+  Serial.println("✅ UART2 (Pixhawk MAVLink) inicializado 57600 bps");
   SerialRPI.begin(9600, SERIAL_8N1, RPI_RX, RPI_TX);
   SerialRPI.setTimeout(RPI_TIMEOUT_MS);
   memset(rpiBuffer, 0, sizeof(rpiBuffer));
   Serial.println("✅ UART0 (USB) OK");
-  Serial.println("✅ UART2 (GPS) inicializado 9600 bps");
   Serial.println("✅ UART1 (RPI) inicializado 9600 bps");
-
-
   LoRa.setPins(LORA_CS,LORA_RST,LORA_IRQ);
   if(!LoRa.begin(LORA_BAND)){Serial.println("❌ LoRa fallo");while(1)delay(1000);}
   Serial.println("✅ LoRa listo");
 
-  if(bmp.begin(0x76)){
-    bmp_ok=true;
-    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,Adafruit_BMP280::SAMPLING_X2,
-                    Adafruit_BMP280::SAMPLING_X16,Adafruit_BMP280::FILTER_X16,
-                    Adafruit_BMP280::STANDBY_MS_63);
-    Serial.println("✅ BMP280 detectado");
-  } else Serial.println("⚠️ BMP280 no encontrado");
-
-  initMPU9250();
-  initHMC5883L();
-  calibrateIMU_Static();
-  loadTrims();
-  loadPID();
-  printMagCalibration();
   delay(1500);
 }
 
 void loop(){
-  //Serial.println("inicio");
-  updateGPS();
-  //Serial.println("gps");
+  readMavlink();
+  // 2) Enviar heartbeat al Pixhawk cada 1 s
+  if (millis() - lastHeartbeatMs >= 1000) {
+    sendHeartbeatToPixhawk();
+    lastHeartbeatMs = millis();
+  }
+
   handleTelemetry();
-  //Serial.println("tm");
   handleSerialRPI();
-  //Serial.println("rpi");
   handleLoRa();
-  //Serial.println("lora");
   checkPendingAcks();
-  //Serial.println("ack");
   updateStateMachine();
-  //Serial.println("fsm");
   simulateDroneMotion();
-  //Serial.println("fsm-sim");
-  updateIMU();
-  //Serial.println("imu");
-  updateMagCalibrationPRO();
-  //Serial.println("magupd");
-  checkMagQualitySuggest();
- // Serial.println("magqua");
-  if (Serial.available()) {
-  char c = Serial.read();
-  if (c == 'M') testMagnetometerAK8963();
 }
 
-}
+
