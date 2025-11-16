@@ -93,6 +93,24 @@ void saveTrims() {
   prefs.end();
 }
 
+// ============================================================================
+// ⚙️ CONFIGURACIÓN DE MISION
+// ============================================================================
+struct Coordinate {
+  double lat;
+  double lon;
+};
+
+struct MissionData {
+  Coordinate home;
+  float altitude;
+  float spacing;
+  String event_action;
+  std::vector<Coordinate> polygon;
+  bool loaded = false; 
+};
+
+MissionData mission;
 
 // ============================================================================
 // 🔹 FUNCIONES DE UTILIDAD
@@ -532,7 +550,59 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       return;
     }
 
-    
+<<<<<<< HEAD
+    else if (strcmp(t, "MISSION_COMPACT") == 0) {
+      Serial.println("📦 Recibido MISSION_COMPACT");
+
+      JsonObject d = doc["d"];   // 👈 ESTA LÍNEA CREA 'd'
+      if (d.isNull()) {
+        Serial.println("❌ Error: campo 'd' ausente en MISSION_COMPACT");
+        return;
+      }
+
+      // Limpiar misión anterior
+      mission.polygon.clear();
+
+      // Cargar coordenadas del polígono
+      JsonArray p = d["p"];
+      if (!p.isNull()) {
+        for (JsonArray coord : p) {
+          if (coord.size() == 2) {
+            Coordinate pt;
+            pt.lat = coord[0];
+            pt.lon = coord[1];
+            mission.polygon.push_back(pt);
+          }
+        }
+      }
+
+      // Cargar HOME
+      JsonArray h = d["h"];
+      if (!h.isNull() && h.size() == 2) {
+        mission.home.lat = h[0];
+        mission.home.lon = h[1];
+      }
+
+      // Cargar otros parámetros
+      mission.altitude = d["a"] | 20.0;
+      mission.spacing = d["s"] | 10.0;
+      mission.event_action = String((const char*)d["event_action"] | "NONE");
+      mission.loaded = true;
+
+      // Debug
+      Serial.println("✅ Misión parseada correctamente:");
+      Serial.printf("   HOME:     %.6f, %.6f\n", mission.home.lat, mission.home.lon);
+      Serial.printf("   Altitud:  %.1f m\n", mission.altitude);
+      Serial.printf("   Spacing:  %.1f m\n", mission.spacing);
+      Serial.printf("   Acción:   %s\n", mission.event_action.c_str());
+      Serial.printf("   Waypoints: %d\n", mission.polygon.size());
+
+      // Enviar ACK
+      sendAckToGS(doc["id"].as<String>());
+    }
+
+   }
+=======
     if (strcmp(type, "MISSION_COMPACT") == 0) {
       Serial.println("📦 Recibido MISSION_COMPACT");
 
@@ -592,7 +662,7 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       return;
     }  // ✅ cierre del bloque MISSION_COMPACT
   }    // ✅ cierre del bloque fromGS
-
+>>>>>>> e64acf0d2a666b92065987e49209423d789a24b7
 
   // ==========================================================
   // 🔹 2. Mensajes internos del dron (desde RPi / simulador)
@@ -668,6 +738,9 @@ void handleLoRa(){
   while(extractNextFrame(loraRxBuf,js,GS_HDR)){processIncomingJSON(js,true);}
 }
 
+// ======================================================
+// Simulación de vuelo interpolado entre dos coordenadas
+// ======================================================
 
 // ============================================================
 // 🧭 Simulación de vuelo simple con estabilización de cámaras
@@ -719,9 +792,8 @@ void simulateFlight(const Coordinate& start,
 
       Serial.println("📤 Enviado a RPi: " + jsonStr);
 
-      delay(5000);  // tiempo de estabilización
+      delay(3500);  // tiempo de estabilización
       accumulated = 0.0;
-      handleSerialRPI();
     }
 
     delay(stepTime);
