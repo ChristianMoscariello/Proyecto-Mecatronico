@@ -11,6 +11,7 @@
 #include <vector>
 #include <HardwareSerial.h>
 #include <MAVLink.h>   // Librería de Oleg Kalachev
+#include <ESP32Servo.h>
 
 using std::vector;
 
@@ -48,6 +49,19 @@ bool  receivingJson = false;
 #define MAV_RX 16   // ESP32 RX ← Pixhawk TX (TELEM2)
 #define MAV_TX 17   // ESP32 TX → Pixhawk RX (TELEM2)
 HardwareSerial SerialMAV(2);
+
+// ============================================================================
+// ⚙️ SERVO DE ACCIÓN (detección PERSON)
+// ============================================================================
+Servo actionServo;
+
+const int SERVO_PIN = 25;      // GPIO donde conectás el servo
+const int SERVO_CLOSED = 0;    // grados (cerrado)
+const int SERVO_OPEN   = 90;   // grados (abierto)
+
+bool servoActive = false;
+unsigned long servoOpenStartMs = 0;
+const unsigned long SERVO_OPEN_TIME = 10000;  // 10 segundos
 
 // ============================================================================
 // 📌 ESTRUCTURAS Y ESTADO GLOBAL
@@ -124,6 +138,42 @@ enum DroneState {
 DroneState state = IDLE;
 unsigned long stateEntryTime   = 0;
 unsigned long insideRadiusSince = 0;
+
+// ============================================================================
+// 📡 Enviar estado de la FSM a la Ground Station
+// ============================================================================
+String stateToString(DroneState s) {
+  switch (s) {
+    case IDLE:          return "IDLE";
+    case TAKEOFF:       return "TAKEOFF";
+    case NAVIGATE:      return "NAVIGATE";
+    case STABILIZE:     return "STABILIZE";
+    case WAIT_ANALYSIS: return "WAIT_ANALYSIS";
+    case RETURN_HOME:   return "RETURN_HOME";
+    case LAND:          return "LAND";
+    case COMPLETE:      return "COMPLETE";
+    default:            return "UNKNOWN";
+  }
+}
+
+void sendStatusToGS(DroneState s) {
+  StaticJsonDocument<128> doc;
+  doc["t"] = "STATUS";
+  doc["state"] = stateToString(s);
+  doc["ts"] = millis();
+
+  String payload;
+  serializeJson(doc, payload);
+
+  String frame = String(UAV_HDR) + payload + String(SFX);
+
+  LoRa.beginPacket();
+  LoRa.print(frame);
+  LoRa.endPacket();
+
+  Serial.printf("📤 [STATUS] %s\n", stateToString(s).c_str());
+}
+
 
 // Análisis RPi
 enum AnalysisResult { NONE, GO, FIRE, PERSON };
@@ -874,10 +924,28 @@ void generateMissionPath(Mission& m) {
     pt.lon = start.lon + (end.lon - start.lon) * t;
     pathPoints.push_back(pt);
   }
-
+  notifyWaypointCountToGS();
   Serial.printf("🧭 %d waypoints generados (dist=%.1fm spacing=%.1f)\n",
                 (int)pathPoints.size(), totalDist, m.spacing);
 }
+
+void notifyWaypointCountToGS() {
+  StaticJsonDocument<128> doc;
+  doc["t"] = "WAYPOINTS_INFO";
+  doc["total"] = pathPoints.size();
+  doc["ts"] = millis();
+
+  String payload;
+  serializeJson(doc, payload);
+  String frame = String(UAV_HDR) + payload + String(SFX);
+
+  LoRa.beginPacket();
+  LoRa.print(frame);
+  LoRa.endPacket();
+
+  Serial.printf("📤 [GS] WAYPOINTS_INFO total=%d\n", pathPoints.size());
+}
+
 
 // ============================================================================
 // ✈ NAVEGACIÓN HACIA UN WAYPOINT (envía GOTO Pixhawk)
@@ -892,11 +960,43 @@ void navigateTo(const Coordinate& target) {
   sendGotoPixhawk(target);
 }
 
-// ============================================================================
-// 🚁 STATE MACHINE COMPLETA (Opción A – paradas en cada waypoint)
-// ============================================================================
-void resetMissionState();
+void notifyWaypointReached(int wp) {
+  StaticJsonDocument<128> doc;
+  doc["t"] = "WAYPOINT_REACHED";
+  doc["wp"] = wp;
+  doc["ts"] = millis();
 
+  String payload;
+  serializeJson(doc, payload);
+  String frame = String(UAV_HDR) + payload + String(SFX);
+
+  LoRa.beginPacket();
+  LoRa.print(frame);
+  LoRa.endPacket();
+
+  Serial.printf("📤 [GS] WAYPOINT_REACHED wp=%d\n", wp);
+}
+
+void triggerServoAction() {
+  actionServo.write(SERVO_OPEN);
+  servoActive = true;
+  servoOpenStartMs = millis();
+  Serial.println("🟢 SERVO → ABIERTO (inicio)");
+}
+void handleServoAction() {
+  if (!servoActive) return;
+
+  // Si el tiempo pasó → cerrar servo
+  if (millis() - servoOpenStartMs >= SERVO_OPEN_TIME) {
+    actionServo.write(SERVO_CLOSED);
+    servoActive = false;
+    Serial.println("🔴 SERVO → CERRADO (fin)");
+  }
+}
+
+// ============================================================================
+// 🚁 STATE MACHINE COMPLETA 
+// ============================================================================
 void updateStateMachine() {
 
   // Prioridad: DISARM / RETURN por LoRa
@@ -917,6 +1017,7 @@ void updateStateMachine() {
 
     case IDLE:
       // Espera ARM + MISSION_COMPACT
+      sendStatusToGS(state);
       break;
 
     case TAKEOFF: {
@@ -924,6 +1025,7 @@ void updateStateMachine() {
         Serial.println("🛫 Altitud de seguridad → NAVIGATE");
         state = NAVIGATE;
         stateEntryTime = millis();
+        sendStatusToGS(state);
       }
       break;
     }
@@ -933,6 +1035,7 @@ void updateStateMachine() {
       if (currentWaypoint >= (int)pathPoints.size()) {
         Serial.println("🏁 Fin de ruta → RETURN_HOME");
         state = RETURN_HOME;
+        sendStatusToGS(state);
         break;
       }
 
@@ -945,6 +1048,7 @@ void updateStateMachine() {
       if (close_enough && slow_enough) {
         if (millis() - insideRadiusSince > 1500) {
           Serial.printf("✔ WAYPOINT %d alcanzado\n", currentWaypoint);
+          notifyWaypointReached(currentWaypoint);
           state = STABILIZE;
           stateEntryTime = millis();
           analysisResult = NONE;
@@ -963,6 +1067,7 @@ void updateStateMachine() {
         Serial.println("📷 Estabilizado → WAIT_ANALYSIS");
         analysisStartTime = millis();
         state = WAIT_ANALYSIS;
+        sendStatusToGS(state);
       }
       break;
 
@@ -989,8 +1094,8 @@ void updateStateMachine() {
           currentWaypoint++;
           state = NAVIGATE;
         }
-        else if (analysisResult == FIRE || analysisResult == PERSON) {
-          Serial.println("🔥 Evento detectado por RPi");
+        else if (analysisResult == FIRE) {
+          Serial.println("🔥 Evento FIRE detectado por RPi");
 
           if (mission.event_action.equalsIgnoreCase("RETURN")) {
             Serial.println("↩️ event_action=RETURN → HOME");
@@ -999,6 +1104,19 @@ void updateStateMachine() {
             Serial.println("➡️ event_action=CONTINUE → siguiente WP");
             currentWaypoint++;
             state = NAVIGATE;
+          }
+        }
+
+        else if (analysisResult == PERSON) {
+          Serial.println("🧍 PERSON detectado → activando SERVO 10s");
+          triggerServoAction(); 
+          if (mission.event_action.equalsIgnoreCase("RETURN")) {
+            Serial.println("↩️ event_action=RETURN → HOME");
+            state = RETURN_HOME;
+          } else {
+            Serial.println("➡️ event_action=CONTINUE → siguiente WP");
+            currentWaypoint++;
+            state = NAVIGATE; 
           }
         }
 
@@ -1012,6 +1130,7 @@ void updateStateMachine() {
         analysisResult = NONE;
         state = NAVIGATE;
       }
+      sendStatusToGS(state);
       break;
     }
 
@@ -1025,6 +1144,7 @@ void updateStateMachine() {
         Serial.println("🏠 HOME alcanzado → LAND");
         state = LAND;
       }
+      sendStatusToGS(state);
       break;
     }
 
@@ -1033,10 +1153,12 @@ void updateStateMachine() {
         Serial.println("🟢 Aterrizaje completo → COMPLETE");
         state = COMPLETE;
       }
+      sendStatusToGS(state);
       break;
 
     case COMPLETE:
       Serial.println("🎉 Misión finalizada");
+      sendStatusToGS(state);
       resetMissionState();
       break;
   }
@@ -1066,6 +1188,7 @@ void simulateDroneMotion() {
   switch (state) {
 
     case IDLE:
+      sendStatusToGS(state);
       break;
 
     case TAKEOFF:
@@ -1075,6 +1198,7 @@ void simulateDroneMotion() {
         Serial.println("🛫 [SIM] Altitud alcanzada → NAVIGATE");
         state = NAVIGATE;
         stateEntryTime = millis();
+        sendStatusToGS(state);
       }
       break;
 
@@ -1082,6 +1206,7 @@ void simulateDroneMotion() {
       if (currentWaypoint >= (int)pathPoints.size()) {
         Serial.println("🏁 [SIM] Último WP → RETURN_HOME");
         state = RETURN_HOME;
+        sendStatusToGS(state);
         break;
       }
 
@@ -1097,9 +1222,11 @@ void simulateDroneMotion() {
 
         if (dist < 1.5) {
           Serial.printf("✔ [SIM] WP%d alcanzado → STABILIZE\n", currentWaypoint);
+          notifyWaypointReached(currentWaypoint);
           sendStableToRPi(target);
           state = STABILIZE;
           stateEntryTime = millis();
+          sendStatusToGS(state);
         }
       }
       break;
@@ -1109,14 +1236,18 @@ void simulateDroneMotion() {
         Serial.println("📷 [SIM] WAIT_ANALYSIS");
         analysisStartTime = millis();
         state = WAIT_ANALYSIS;
+        sendStatusToGS(state);
       }
       break;
 
     case WAIT_ANALYSIS:
+
+      // --- Comandos externos ---
       if (loraReturnCommand) {
         Serial.println("↩️ [SIM] RETURN");
         loraReturnCommand = false;
         state = RETURN_HOME;
+        sendStatusToGS(state);
         break;
       }
 
@@ -1126,32 +1257,60 @@ void simulateDroneMotion() {
         break;
       }
 
+      // --- Análisis recibido desde RPi ---
       if (analysisResult == GO) {
         Serial.println("➡️ [SIM] GO → siguiente WP");
         currentWaypoint++;
         analysisResult = NONE;
         state = NAVIGATE;
+        sendStatusToGS(state);
+        break;
       }
-      else if (analysisResult == FIRE || analysisResult == PERSON) {
-        Serial.printf("🔥 [SIM] %s detectado\n",
-                      analysisResult == FIRE ? "FIRE" : "PERSON");
 
-        if (mission.event_action == "RETURN") {
-          Serial.println("↩️ [SIM] RETURN_HOME");
+      else if (analysisResult == FIRE) {
+        Serial.println("🔥 [SIM] FIRE detectado");
+
+        if (mission.event_action.equalsIgnoreCase("RETURN")) {
+          Serial.println("↩️ event_action=RETURN → HOME");
           state = RETURN_HOME;
         } else {
-          Serial.println("➡️ [SIM] CONTINUE");
+          Serial.println("➡️ event_action=CONTINUE → siguiente WP");
           currentWaypoint++;
           state = NAVIGATE;
         }
+
         analysisResult = NONE;
+        sendStatusToGS(state);
+        break;
       }
-      else if (millis() - analysisStartTime > ANALYSIS_TIMEOUT) {
+
+      else if (analysisResult == PERSON) {
+        Serial.println("🧍 [SIM] PERSON detectado → SERVO 10s");
+        triggerServoAction();
+
+        if (mission.event_action.equalsIgnoreCase("RETURN")) {
+          Serial.println("↩️ event_action=RETURN → HOME");
+          state = RETURN_HOME;
+        } else {
+          Serial.println("➡️ event_action=CONTINUE → siguiente WP");
+          currentWaypoint++;
+          state = NAVIGATE;
+        }
+
+        analysisResult = NONE;
+        sendStatusToGS(state);
+        break;
+      }
+
+      // --- Timeout de análisis ---
+      if (millis() - analysisStartTime > ANALYSIS_TIMEOUT) {
         Serial.println("⌛ [SIM] Timeout → siguiente WP");
         currentWaypoint++;
         analysisResult = NONE;
         state = NAVIGATE;
+        sendStatusToGS(state);
       }
+
       break;
 
     case RETURN_HOME:
@@ -1165,6 +1324,7 @@ void simulateDroneMotion() {
         if (distHome < 1.5) {
           Serial.println("🛬 [SIM] HOME → LAND");
           state = LAND;
+          sendStatusToGS(state);
         }
       }
       break;
@@ -1175,12 +1335,14 @@ void simulateDroneMotion() {
       if (alt_f <= 0.5) {
         Serial.println("🟢 [SIM] Aterrizaje completo");
         state = COMPLETE;
+        sendStatusToGS(state);
       }
       break;
 
     case COMPLETE:
       Serial.println("🎉 [SIM] Fin misión");
       resetMissionState();
+      sendStatusToGS(state);
       break;
   }
 }
@@ -1214,6 +1376,11 @@ void setup() {
 
   have_filter = false;
   gpsWarmup   = 0;
+
+  // Servo de acción
+  actionServo.attach(SERVO_PIN);
+  actionServo.write(SERVO_CLOSED);
+  Serial.println("✅ Servo listo (cerrado)");
 
   delay(1500);
   Serial.println("🚀 Sistema iniciado");
@@ -1250,4 +1417,7 @@ void loop() {
 
   // 8) Simulador (si SIM_ON)
   simulateDroneMotion();
+
+  handleServoAction();
+
 }
