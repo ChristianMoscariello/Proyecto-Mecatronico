@@ -50,6 +50,8 @@ bool  receivingJson = false;
 #define MAV_RX 16   // ESP32 RX ← Pixhawk TX (TELEM2)
 #define MAV_TX 17   // ESP32 TX → Pixhawk RX (TELEM2)
 HardwareSerial SerialMAV(2);
+unsigned long lastGotoMs = 0;
+static unsigned long lastHbMs = 0;
 
 // ============================================================================
 // ⚙️ SERVO DE ACCIÓN (detección PERSON)
@@ -218,7 +220,7 @@ int currentWaypoint = 0;
 vector<Coordinate> pathPoints;
 
 // Timeout análisis
-const unsigned long ANALYSIS_TIMEOUT = 90000;
+const unsigned long ANALYSIS_TIMEOUT = 6000;
 unsigned long analysisStartTime = 0;
 
 // Comandos por LoRa
@@ -358,6 +360,28 @@ void pixhawkArm(bool arm) {
 
   SerialMAV.write(buf, mavlink_msg_to_send_buffer(buf, &msg));
 }
+
+void pixhawkDisarmForce() {
+    mavlink_message_t msg;
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+    mavlink_msg_command_long_pack(
+        42, 200,       // ESP32 sysid/com pid
+        &msg,
+        1, 1,          // target Pixhawk
+        MAV_CMD_COMPONENT_ARM_DISARM,
+        0,
+        0.0f,          // param1 = 0 → DISARM
+        21196,         // param2 = 21196 → FORCE DISARM
+        0,0,0,0,0
+    );
+
+    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+    SerialMAV.write(buf, len);
+
+    Serial.println("🛑 MAV → FORCE DISARM enviado");
+}
+
 
 void setModeGuided() {
   mavlink_message_t msg;
@@ -831,11 +855,12 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
         Serial.println("🛑 GS → DISARM");
 
         // 1) Intento inmediato de desarmado real
-        pixhawkArm(false);
+        pixhawkDisarmForce();
 
         // 2) Marcamos bandera para la FSM
         loraDisarmCommand = true;
-
+        delay(50);
+        pixhawkDisarmForce();
         // 3) Avisamos a la estación
         sendAckToGS(msgId);
 
@@ -1126,7 +1151,9 @@ void navigateTo(const Coordinate& target) {
   Serial.printf("🧭 NAV → bearing=%.1f°, dist=%.1f m → (%.6f, %.6f)\n",
                 bearing, dist, target.lat, target.lon);
 
-  sendMavGoto(target.lat, target.lon, mission.altitude);
+      if (millis() - lastGotoMs > 500) {
+        sendMavGoto(target.lat, target.lon, mission.altitude);
+        lastGotoMs = millis();}
 
 }
 
@@ -1585,7 +1612,7 @@ void requestMavlinkStreams() {
       &msg,
       1, 1,              // target system & component (Pixhawk)
       MAV_DATA_STREAM_POSITION,
-      10,                // 10 Hz
+      5,                // 5 Hz
       1);                // start
 
   uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
@@ -1594,7 +1621,7 @@ void requestMavlinkStreams() {
   // Request EXTRA2 (contains VFR_HUD)
   mavlink_msg_request_data_stream_pack(
       42,199,&msg,
-      1,1,
+      5,1,
       MAV_DATA_STREAM_EXTRA2,
       10,1);
 
@@ -1612,7 +1639,7 @@ void setup() {
   Serial.println("===============================");
 
   // UART MAVLink
-  SerialMAV.begin(57600, SERIAL_8N1, MAV_RX, MAV_TX);
+  SerialMAV.begin(115200, SERIAL_8N1, MAV_RX, MAV_TX);
   Serial.println("✅ UART2 Pixhawk (MAVLink) inicializada");
 
   // UART Raspberry
@@ -1651,10 +1678,11 @@ void loop() {
   readMavlink();
 
   // 2) Heartbeat a Pixhawk
-  if (millis() - lastHeartbeatMs >= 1000) {
-    sendHeartbeatToPixhawk();
-    lastHeartbeatMs = millis();
-  }
+    
+    if (millis() - lastHbMs > 1000) {
+        sendHeartbeatToPixhawk();
+        lastHbMs = millis();
+    }
 
   // 3) Telemetría hacia GS
   handleTelemetry();
