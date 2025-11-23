@@ -50,6 +50,8 @@ bool  receivingJson = false;
 #define MAV_RX 16   // ESP32 RX ← Pixhawk TX (TELEM2)
 #define MAV_TX 17   // ESP32 TX → Pixhawk RX (TELEM2)
 HardwareSerial SerialMAV(2);
+unsigned long lastGotoMs = 0;
+static unsigned long lastHbMs = 0;
 
 // ============================================================================
 // ⚙️ SERVO DE ACCIÓN (detección PERSON)
@@ -192,8 +194,8 @@ void sendStatusToGS(DroneState st) {
   StaticJsonDocument<128> doc;
   doc["t"] = "STATUS";
 
-  JsonObject d = doc.createNestedObject("d");
-  d["message"] = stateToString(st);
+  //JsonObject d = doc.createNestedObject("d");
+  doc["message"] = stateToString(st);
 
   doc["ts"] = millis();
 
@@ -218,7 +220,7 @@ int currentWaypoint = 0;
 vector<Coordinate> pathPoints;
 
 // Timeout análisis
-const unsigned long ANALYSIS_TIMEOUT = 90000;
+const unsigned long ANALYSIS_TIMEOUT = 6000;
 unsigned long analysisStartTime = 0;
 
 // Comandos por LoRa
@@ -359,6 +361,28 @@ void pixhawkArm(bool arm) {
   SerialMAV.write(buf, mavlink_msg_to_send_buffer(buf, &msg));
 }
 
+void pixhawkDisarmForce() {
+    mavlink_message_t msg;
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+    mavlink_msg_command_long_pack(
+        42, 200,       // ESP32 sysid/com pid
+        &msg,
+        1, 1,          // target Pixhawk
+        MAV_CMD_COMPONENT_ARM_DISARM,
+        0,
+        0.0f,          // param1 = 0 → DISARM
+        21196,         // param2 = 21196 → FORCE DISARM
+        0,0,0,0,0
+    );
+
+    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+    SerialMAV.write(buf, len);
+
+    Serial.println("🛑 MAV → FORCE DISARM enviado");
+}
+
+
 void setModeGuided() {
   mavlink_message_t msg;
   uint8_t buf[MAVLINK_MAX_PACKET_LEN];
@@ -373,74 +397,79 @@ void setModeGuided() {
   SerialMAV.write(buf, mavlink_msg_to_send_buffer(buf, &msg));
 }
 
-void pixhawkSetModeGuided() {
-  mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-
-  mavlink_msg_set_mode_pack(
-      42,                  // system_id ESP32
-      199,                 // component_id
-      &msg,
-      1,                   // target system (Pixhawk)
-      MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-      4                    // GUIDED mode
-  );
-
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  SerialMAV.write(buf, len);
-
-  Serial.println("📡 MAV → GUIDED enviado");
-}
-
-
 void pixhawkTakeoff(float alt) {
-  mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-
-  mavlink_msg_command_long_pack(
-      42, 200,
-      &msg,
-      1, 0,
-      MAV_CMD_NAV_TAKEOFF,
-      0,
-      0,0,0,0,
-      mission.home.lat,
-      mission.home.lon,
-      alt);
-
-  SerialMAV.write(buf, mavlink_msg_to_send_buffer(buf, &msg));
-  Serial.printf("🚁 TAKEOFF → %.1f m\n", alt);
-}
-
-void sendMavGoto(double lat, double lon, float alt) {
-
     mavlink_message_t msg;
-    mavlink_command_long_t cmd = {0};
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
 
-    cmd.target_system    = 1;
-    cmd.target_component = 1;
-    cmd.command          = MAV_CMD_DO_REPOSITION;
-    cmd.confirmation     = 0;
+    mavlink_msg_command_long_pack(
+        42, 200,         // sysid, compid
+        &msg,
+        1, 0,            // target system, component
+        MAV_CMD_NAV_TAKEOFF,
+        0,               // confirmation
+        0, 0, 0, 0,      // params 1–4 (unused)
+        0, 0,            // lat/lon ignored by ArduPilot
+        alt              // param7 = relative altitude
+    );
 
-    cmd.param1 = 0; // pause=0
-    cmd.param2 = 0; // Yaw unchanged
-    cmd.param3 = 0;
-    cmd.param4 = 0;
-
-    cmd.param5 = lat;
-    cmd.param6 = lon;
-    cmd.param7 = alt;
-
-    mavlink_msg_command_long_encode(255, 190, &msg, &cmd);
-
-    uint8_t buf[300];
     uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-
     SerialMAV.write(buf, len);
 
-    Serial.printf(">> GOTO lat=%.7f lon=%.7f alt=%.1f\n", lat, lon, alt);
+    Serial.printf("🚁 TAKEOFF cmd → %.1f m\n", alt);
 }
 
+
+void sendMavGoto(double lat, double lon, float alt) {
+    mavlink_message_t msg;
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+    uint16_t type_mask =
+        (1 << 3) | (1 << 4) | (1 << 5) |   // ignorar velocidades
+        (1 << 6) | (1 << 7) | (1 << 8) |   // ignorar aceleraciones
+        (1 << 9) | (1 << 10);              // ignorar yaw/yaw_rate
+
+    mavlink_msg_set_position_target_global_int_pack(
+        42, 200,                     // sysid, compid
+        &msg,
+        millis(),                    // tiempo
+        1, 1,                        // target system, component
+        MAV_FRAME_GLOBAL_RELATIVE_ALT,
+        type_mask,
+        (int32_t)(lat * 1e7),
+        (int32_t)(lon * 1e7),
+        alt,                         // altitud relativa
+        0, 0, 0,                     // vx,vy,vz ignorados
+        0, 0, 0,                     // ax,ay,az ignorados
+        0, 0                         // yaw / yaw rate ignorados
+    );
+
+    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+    SerialMAV.write(buf, len);
+
+    Serial.printf("🧭 GOTO → %.7f , %.7f  alt=%.1f\n", lat, lon, alt);
+}
+
+void pixhawkLand() {
+    mavlink_message_t msg;
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+    mavlink_msg_command_long_pack(
+        42, 200,      // sysid, compid ESP32
+        &msg,
+        1, 0,         // target: Pixhawk
+        MAV_CMD_NAV_LAND,
+        0,            // confirmation
+        0, 0, 0, 0,   // params 1–4 sin usar
+        mission.home.lat,   // opcional
+        mission.home.lon,   // opcional
+        0                  // altitud objetivo = 0
+    );
+
+    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+    SerialMAV.write(buf, len);
+
+    Serial.println("⬇️ Enviando comando LAND al Pixhawk...");
+}
 
 void readMavlink() {
   mavlink_message_t msg;
@@ -790,24 +819,56 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
 
     // ARM → GUIDED + ARM
     if (strcmp(type, "ARM") == 0) {
-      Serial.println("📡 GS → ARM");
+      
+      Serial.println("📡 GS → ARM solicitado");
+
+      // 1) Pedimos GUIDED antes del ARM
+      setModeGuided();
+      delay(150);
+
+      // 2) Enviamos ARM
+      pixhawkArm(true);
+
+      // 3) Entramos al estado ARMING (FSM va a verificar)
       state = ARMING;
       stateEntryTime = millis();
       sendStatusToGS(state);
 
-      pixhawkSetModeGuided();
-      delay(200);
+      // 4) Intento de confirmación rápida (2 s)
+      unsigned long confirmStart = millis();
+      while (!mav_armed && millis() - confirmStart < 2000) {
+          readMavlink();   // actualizar mav_armed a partir del heartbeat
+      }
 
-      pixhawkArm(true);
+      // 5) Si ARMÓ rápido → pasamos directamente a READY_FOR_MISSION
+      if (mav_armed) {
+          Serial.println("✔ ARM confirmado por MAVLink (confirmación rápida)");
+          state = READY_FOR_MISSION;
+          sendStatusToGS(state);
+      }
+
       return;
-    }
+     }
 
     // DISARM (bandera, se atiende en la FSM)
     if (strcmp(type, "DISARM") == 0) {
-      Serial.println("🛑 DISARM recibido");
-      loraDisarmCommand = true;
-      sendAckToGS(msgId);
-      return;
+        Serial.println("🛑 GS → DISARM");
+
+        // 1) Intento inmediato de desarmado real
+        pixhawkDisarmForce();
+
+        // 2) Marcamos bandera para la FSM
+        loraDisarmCommand = true;
+        delay(50);
+        pixhawkDisarmForce();
+        // 3) Avisamos a la estación
+        sendAckToGS(msgId);
+
+        // 4) Actualizamos estado
+        state = IDLE;
+        sendStatusToGS(state);
+
+        return;
     }
 
     // RETURN (bandera)
@@ -1090,7 +1151,9 @@ void navigateTo(const Coordinate& target) {
   Serial.printf("🧭 NAV → bearing=%.1f°, dist=%.1f m → (%.6f, %.6f)\n",
                 bearing, dist, target.lat, target.lon);
 
-  sendMavGoto(target.lat, target.lon, mission.altitude);
+      if (millis() - lastGotoMs > 500) {
+        sendMavGoto(target.lat, target.lon, mission.altitude);
+        lastGotoMs = millis();}
 
 }
 
@@ -1133,6 +1196,14 @@ void handleServoAction() {
 // ============================================================================
 void updateStateMachine() {
 
+  // ---- FAILSAFE por pérdida de telemetría ----
+  if (millis() - mav_last_update_ms > 2500) {  // 2.5 segundos sin datos
+      Serial.println("❌ FAILSAFE: MAVLink perdido → RETURN_HOME");
+      state = RETURN_HOME;
+      sendStatusToGS(state);
+  }
+
+
   // --- Prioridad: DISARM / RETURN ---
   if (loraDisarmCommand) {
     Serial.println("🛑 DISARM por LoRa → abortando misión");
@@ -1156,26 +1227,46 @@ void updateStateMachine() {
       sendStatusToGS(state);
       break;
 
-    case ARMING:
+    case ARMING: {
 
-      // Esperamos heartbeat indicando armado
-      if (mav_armed) {
-          Serial.println("✔ ARMADO OK");
-          state = READY_FOR_MISSION;
-          sendStatusToGS(state);
-      }
+        // 1) Confirmación rápida de ARM (primeros 2 segundos)
+        if (!mav_armed && millis() - stateEntryTime < 2000) {
+            // lee MAVLink para forzar actualización de mav_armed
+            readMavlink();
+        }
 
-      // Si pasa demasiado tiempo, error
-      if (millis() - stateEntryTime > 8000) {
-          Serial.println("❌ ERROR: no se armó");
-          pixhawkArm(false);
-          state = IDLE;
-          sendStatusToGS(state);
-      }
-      break;
+        // 2) Si ARMÓ → seguimos
+        if (mav_armed) {
+            Serial.println("✔ ARMADO OK");
+            state = READY_FOR_MISSION;
+            sendStatusToGS(state);
+            break;
+        }
+
+        // 3) Si pasan más de 8 segundos → error de armado
+        if (millis() - stateEntryTime > 8000) {
+            Serial.println("❌ ERROR: Pixhawk NO ARMÓ");
+
+            // Forzamos desarmado por seguridad
+            pixhawkArm(false);
+
+            // Volvemos al estado inicial
+            state = IDLE;
+            sendStatusToGS(state);
+            break;
+        }
+
+        // Aún en ARMING → informar estado una sola vez
+        sendStatusToGS(state);
+        break;
+    }
+
 
     case READY_FOR_MISSION:
-    // Espera MISSION_COMPACT
+    if (!mav_has_fix || mav_alt_rel == 0 || mav_lat == 0) {
+    Serial.println("❌ No GPS FIX, esperando...");
+    return;
+    }
        break;
 
     case PREPARE_TAKEOFF:
@@ -1200,42 +1291,50 @@ void updateStateMachine() {
 
     case NAVIGATE: {
 
-      if (currentWaypoint >= (int)pathPoints.size()) {
-        Serial.println("🏁 Fin ruta → RETURN_HOME");
-        state = RETURN_HOME;
-        sendStatusToGS(state);
-        break;
-      }
-
-      Coordinate target = pathPoints[currentWaypoint];
-      double dist = haversineDistance(mav_lat, mav_lon, target.lat, target.lon);
-      bool close_enough = dist < 3.0;
-      bool slow_enough  = mav_ground_speed < 0.5;
-
-      if (close_enough && slow_enough) {
-        if (millis() - insideRadiusSince > 1500) {
-          Serial.printf("✔ WP %d alcanzado\n", currentWaypoint);
-          notifyWaypointReached(currentWaypoint);
-
-          state = STABILIZE;
-          stateEntryTime = millis();
-          analysisResult = NONE;
-          sendStableToRPi(target);
-
-          sendStatusToGS(state);
-          return;
+        if (currentWaypoint >= (int)pathPoints.size()) {
+            Serial.println("🏁 Fin ruta → RETURN_HOME");
+            state = RETURN_HOME;
+            sendStatusToGS(state);
+            break;
         }
-      } else insideRadiusSince = millis();
 
-      sendMavGoto(target.lat, target.lon, mission.altitude);
-      if (!mav_armed) {  // si se desarma por failsafe
-        Serial.println("⚠ Se desarmó en vuelo → ABORT");
-        state = IDLE;
-        sendStatusToGS(state);
+        Coordinate target = pathPoints[currentWaypoint];
+        double dist = haversineDistance(mav_lat, mav_lon, target.lat, target.lon);
+
+        bool close_enough = dist < 3.0;       // 3 m de radio WP
+        bool stable_speed = mav_ground_speed < 2.0;  // 2 m/s tolerante
+
+        if (close_enough && stable_speed) {
+            if (millis() - insideRadiusSince > 2000) {   // 2 sec dentro del radio
+
+                Serial.printf("✔ WP %d alcanzado\n", currentWaypoint);
+                notifyWaypointReached(currentWaypoint);
+
+                state = STABILIZE;
+                stateEntryTime = millis();
+                analysisResult = NONE;
+
+                sendStableToRPi(target);
+                sendStatusToGS(state);
+                return;
+            }
+        } 
+        else {
+            insideRadiusSince = millis();
+        }
+
+        // Enviar GOTO continuamente mientras navega
+        sendMavGoto(target.lat, target.lon, mission.altitude);
+
+        // Failsafe: si se desarma SOLO aquí te protege del fly-away
+        if (!mav_armed) {
+            Serial.println("⚠ Se desarmó en vuelo → ABORT");
+            state = IDLE;
+            sendStatusToGS(state);
+            break;
+        }
+
         break;
-      }
-
-      break;
     }
 
     case STABILIZE:
@@ -1317,26 +1416,37 @@ void updateStateMachine() {
 
     case RETURN_HOME: {
 
-      double distHome = haversineDistance(mav_lat, mav_lon,
-                                          mission.home.lat, mission.home.lon);
+        double distHome = haversineDistance(
+            mav_lat, mav_lon,
+            mission.home.lat, mission.home.lon
+        );
 
-      sendMavGoto(mission.home.lat, mission.home.lon, mission.altitude);
+        // GOTO continuo hacia HOME
+        sendMavGoto(mission.home.lat, mission.home.lon, mission.altitude);
 
-      if (distHome < 2.0 && mav_ground_speed < 0.5) {
-        Serial.println("🏠 HOME → LAND");
-        state = LAND;
-        sendStatusToGS(state);
-      }
-      break;
+        bool close_home = distHome < 3.5;      // tolerancia realista
+        bool slow_home  = mav_ground_speed < 2.0;
+
+        if (close_home && slow_home) {
+            Serial.println("🏠 HOME → LAND");
+            pixhawkLand();  
+            state = LAND;
+            sendStatusToGS(state);
+        }
+
+        break;
     }
 
+
+
     case LAND:
-      if (mav_alt_rel < 0.8) {
-        Serial.println("🟢 LAND → COMPLETE");
-        state = COMPLETE;
-        sendStatusToGS(state);
-      }
-      break;
+        // Solo monitoreamos
+        if (mav_alt_rel < 0.3 && mav_ground_speed < 0.2) {
+            Serial.println("🟢 Aterrizaje completo");
+            state = COMPLETE;
+            sendStatusToGS(state);
+        }
+        break;
 
     case COMPLETE:
       Serial.println("🎉 COMPLETE → reset");
@@ -1502,7 +1612,7 @@ void requestMavlinkStreams() {
       &msg,
       1, 1,              // target system & component (Pixhawk)
       MAV_DATA_STREAM_POSITION,
-      10,                // 10 Hz
+      5,                // 5 Hz
       1);                // start
 
   uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
@@ -1511,7 +1621,7 @@ void requestMavlinkStreams() {
   // Request EXTRA2 (contains VFR_HUD)
   mavlink_msg_request_data_stream_pack(
       42,199,&msg,
-      1,1,
+      5,1,
       MAV_DATA_STREAM_EXTRA2,
       10,1);
 
@@ -1529,7 +1639,7 @@ void setup() {
   Serial.println("===============================");
 
   // UART MAVLink
-  SerialMAV.begin(57600, SERIAL_8N1, MAV_RX, MAV_TX);
+  SerialMAV.begin(115200, SERIAL_8N1, MAV_RX, MAV_TX);
   Serial.println("✅ UART2 Pixhawk (MAVLink) inicializada");
 
   // UART Raspberry
@@ -1568,10 +1678,11 @@ void loop() {
   readMavlink();
 
   // 2) Heartbeat a Pixhawk
-  if (millis() - lastHeartbeatMs >= 1000) {
-    sendHeartbeatToPixhawk();
-    lastHeartbeatMs = millis();
-  }
+    
+    if (millis() - lastHbMs > 1000) {
+        sendHeartbeatToPixhawk();
+        lastHbMs = millis();
+    }
 
   // 3) Telemetría hacia GS
   handleTelemetry();
