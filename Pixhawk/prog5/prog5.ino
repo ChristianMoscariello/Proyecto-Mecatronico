@@ -1138,7 +1138,7 @@ void generateMissionPath(Mission& m) {
   Coordinate end   = m.polygon[0];
 
   double totalDist = haversineDistance(start.lat, start.lon, end.lat, end.lon);
-  int steps = (m.spacing > 0.5) ? (int)(totalDist / m.spacing) : 1;
+  int steps = (m.spacing > 11) ? (int)(totalDist / m.spacing) : 1;
   if (steps < 1) steps = 1;
 
   for (int i = 0; i <= steps; i++) {
