@@ -677,6 +677,10 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
 
       generateMissionPath(mission);
       sendAckToGS(msgId);
+      if (!pathPoints.empty()) {
+          sendActiveWaypointToGS(0, pathPoints[0]);
+      }
+
 
       Serial.println("🚁 TAKEOFF NATIVO → GUIDED");
       setModeGuided();
@@ -1036,6 +1040,7 @@ void readMavlink() {
           double raw_lat = pos.lat * 1e-7;
           double raw_lon = pos.lon * 1e-7;
           double raw_alt = pos.relative_alt / 1000.0; // m
+          
 
           // Filtrado GPS
           filterGPS(raw_lat, raw_lon, raw_alt,
@@ -1134,8 +1139,8 @@ void notifyWaypointCountToGS() {
   if (!pathPoints.empty()) {
       doc["wp0"]["lat"] = pathPoints[0].lat;
       doc["wp0"]["lon"] = pathPoints[0].lon;
-  }
-
+  
+  sendActiveWaypointToGS(0, pathPoints[0]);}
   String payload;
   serializeJson(doc, payload);
   String frame = String(UAV_HDR) + payload + String(SFX);
@@ -1163,6 +1168,29 @@ void navigateTo(const Coordinate& target) {
         lastGotoMs = millis();}
 
 }
+
+// ============================================================================
+// 📤 NUEVO: Enviar Waypoint Actual a la GS (para dibujarlo en el mapa)
+// ============================================================================
+void sendActiveWaypointToGS(int wp, const Coordinate& pt) {
+    StaticJsonDocument<128> doc;
+    doc["t"]  = "WP_UPDATE";
+    doc["wp"] = wp;
+    doc["lat"] = pt.lat;
+    doc["lon"] = pt.lon;
+    doc["ts"]  = millis();
+
+    String payload;
+    serializeJson(doc, payload);
+    String frame = String(UAV_HDR) + payload + String(SFX);
+
+    LoRa.beginPacket();
+    LoRa.print(frame);
+    LoRa.endPacket();
+
+    Serial.printf("📤 [GS] WP_UPDATE → wp=%d (%.6f, %.6f)\n", wp, pt.lat, pt.lon);
+}
+
 
 void notifyWaypointReached(int wp) {
   StaticJsonDocument<128> doc;
@@ -1329,11 +1357,11 @@ void updateStateMachine() {
         Coordinate target = pathPoints[currentWaypoint];
         double dist = haversineDistance(mav_lat, mav_lon, target.lat, target.lon);
 
-        bool close_enough = dist < 3.0;       // 3 m de radio WP
-        bool stable_speed = mav_ground_speed < 2.0;  // 2 m/s tolerante
+        bool close_enough = dist < 5.0;       // 3 m de radio WP
+        bool stable_speed = mav_ground_speed < 200.0;  // 2 m/s tolerante
 
         if (close_enough && stable_speed) {
-            if (millis() - insideRadiusSince > 2000) {   // 2 sec dentro del radio
+            if (millis() - insideRadiusSince > 1000) {   // 2 sec dentro del radio
 
                 Serial.printf("✔ WP %d alcanzado\n", currentWaypoint);
                 notifyWaypointReached(currentWaypoint);
@@ -1399,7 +1427,14 @@ void updateStateMachine() {
           Serial.println("➡️ GO → NAVIGATE");
           currentWaypoint++;
           state = NAVIGATE;
+
+          // 📤 Enviar waypoint activo nuevo
+          if (currentWaypoint < (int)pathPoints.size()) {
+              sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
+          }
+
           sendStatusToGS(state);
+
         }
 
         else if (analysisResult == FIRE) {
