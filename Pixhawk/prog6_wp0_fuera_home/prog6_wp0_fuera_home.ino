@@ -227,9 +227,6 @@ void sendStatusToGS(DroneState st) {
   Serial.println("📤 STATUS enviado: " + fsmStateToString((int)st));
 }
 
-
-
-
 // Análisis RPi
 enum AnalysisResult { NONE, GO, FIRE, PERSON };
 AnalysisResult analysisResult = NONE;
