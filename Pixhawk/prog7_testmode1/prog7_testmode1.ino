@@ -1337,6 +1337,7 @@ void updateStateMachine() {
 
         if (millis() - lastFailsafeLog > 5000) {
             Serial.println("❌ FAILSAFE: MAVLink perdido → RETURN_HOME");
+            state=RETURN_HOME;
             lastFailsafeLog = millis();
         }
     }
@@ -1457,11 +1458,11 @@ void updateStateMachine() {
         Coordinate target = pathPoints[currentWaypoint];
         double dist = haversineDistance(mav_lat, mav_lon, target.lat, target.lon);
 
-        bool close_enough = dist < 5.0;       // 3 m de radio WP
+        bool close_enough = dist < 7.0;       // 3 m de radio WP
         bool stable_speed = mav_ground_speed < 200.0;  // 2 m/s tolerante
 
         if (close_enough && stable_speed) {
-            if (millis() - insideRadiusSince > 1000) {   // 2 sec dentro del radio
+            if (millis() - insideRadiusSince > 1500) {   // 2 sec dentro del radio
 
                 Serial.printf("✔ WP %d alcanzado\n", currentWaypoint);
                 notifyWaypointReached(currentWaypoint);
