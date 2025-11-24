@@ -677,6 +677,7 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
     if (strcmp(type, "RETURN") == 0) {
       Serial.println("↩️ RETURN recibido");
       loraReturnCommand = true;
+      state=RETURN_HOME;
       sendAckToGS(msgId);
       return;
     }
@@ -1424,7 +1425,7 @@ void updateStateMachine() {
 
         // 🧪 En TEST MODE no hay altitud real → pasamos a NAVIGATE por tiempo
         if (testMode) {
-            if (millis() - stateEntryTime > 1000) {   // 1 segundo en TAKEOFF
+            if (millis() - stateEntryTime > 1500) {   // 1 segundo en TAKEOFF
                 Serial.println("🛫 [TEST] TAKEOFF simulado → NAVIGATE");
                 state = NAVIGATE;
                 stateEntryTime = millis();
@@ -1493,7 +1494,7 @@ void updateStateMachine() {
     }
 
     case STABILIZE:
-      if (millis() - stateEntryTime > 350) {
+      if (millis() - stateEntryTime > 700) {
         Serial.println("📷 Estabilizado → WAIT_ANALYSIS");
         state = WAIT_ANALYSIS;
         analysisStartTime = millis();
@@ -1544,6 +1545,10 @@ void updateStateMachine() {
           else {
             currentWaypoint++;
             state = NAVIGATE;
+            // 📤 Enviar waypoint activo nuevo
+            if (currentWaypoint < (int)pathPoints.size()) {
+                sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
+            }
           }
           sendStatusToGS(state);
         }
@@ -1558,6 +1563,10 @@ void updateStateMachine() {
           else {
             currentWaypoint++;
             state = NAVIGATE;
+            // 📤 Enviar waypoint activo nuevo
+            if (currentWaypoint < (int)pathPoints.size()) {
+                sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
+            }
           }
           sendStatusToGS(state);
         }
@@ -1571,6 +1580,10 @@ void updateStateMachine() {
         Serial.println("⌛ Timeout → NAVIGATE");
         currentWaypoint++;
         state = NAVIGATE;
+        // 📤 Enviar waypoint activo nuevo
+        if (currentWaypoint < (int)pathPoints.size()) {
+            sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
+        }
         sendStatusToGS(state);
       }
 
@@ -1669,7 +1682,7 @@ void simulateDroneMotion() {
       break;
 
     case STABILIZE:
-      if (millis() - stateEntryTime > 350) {
+      if (millis() - stateEntryTime > 700) {
         state = WAIT_ANALYSIS;
         sendStatusToGS(state);
       }
