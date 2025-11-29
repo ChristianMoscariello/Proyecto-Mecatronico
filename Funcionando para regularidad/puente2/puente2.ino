@@ -12,27 +12,21 @@
 // ==========================
 // Variables
 // ==========================
-String incomingUSB = "";  // Buffer para mensajes desde la GS (USB)
+String incomingUSB = "";     // Buffer para datos desde la GS (USB)
+unsigned long ledOffTime = 0;
 
 // ==========================
 // Setup
 // ==========================
 void setup() {
-  Serial.begin(115200);          // Comunicación con la Ground Station
+  Serial.begin(115200);      // Comunicación con la Ground Station
   while (!Serial);
 
-  // Comentado: logs de estado
-  // Serial.println("{\"status\":\"Iniciando puente LoRa-USB\"}");
-
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-
   if (!LoRa.begin(LORA_BAND)) {
-    // Serial.println("{\"error\":\"Fallo inicialización LoRa\"}");
+    // Si falla LoRa, queda en bucle silencioso
     while (true) { delay(1000); }
   }
-
-  // Serial.println("{\"status\":\"LoRa inicializado correctamente\"}");
-  // Serial.println("{\"status\":\"Puente listo\"}");
 }
 
 // ==========================
@@ -50,19 +44,9 @@ void loop() {
       payload += (char)LoRa.read();
     }
 
-    // Envía frame completo a la Ground Station
-    Serial.println(payload);
-
-    // Comentado: RSSI/SNR opcional
-    /*
-    int rssi = LoRa.packetRssi();
-    float snr = LoRa.packetSnr();
-    Serial.print("{\"debug\":\"RSSI:");
-    Serial.print(rssi);
-    Serial.print(" SNR:");
-    Serial.print(snr);
-    Serial.println("\"}");
-    */
+    // Transmitir al puerto USB SIN saltos de línea extra
+    Serial.print(payload);
+    Serial.flush();
   }
 
   // ==========================
@@ -72,18 +56,21 @@ void loop() {
     char c = Serial.read();
     incomingUSB += c;
 
-    // Detectar fin de frame por "#END"
-    if (incomingUSB.endsWith("#END")) {
+    // Procesar todos los frames completos detectando "#END"
+    int idx;
+    while ((idx = incomingUSB.indexOf("#END")) != -1) {
+      String frame = incomingUSB.substring(0, idx + 4); // incluye "#END"
+
       LoRa.beginPacket();
-      LoRa.print(incomingUSB);
+      LoRa.print(frame);
       LoRa.endPacket();
 
-      // Serial.println("{\"info\":\"Frame enviado por LoRa\"}");
-      incomingUSB = "";
+      incomingUSB.remove(0, idx + 4); // eliminar el frame procesado
     }
 
     // Evitar crecimiento infinito del buffer
     if (incomingUSB.length() > 2048)
       incomingUSB = "";
   }
+
 }
