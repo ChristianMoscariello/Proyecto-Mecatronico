@@ -112,6 +112,17 @@ float mav_batt_voltage = 0.0f;
 float mav_batt_current = 0.0f;
 int   mav_batt_remaining = -1;
 //------
+// Traduce el custom_mode de ArduCopter a texto legible
+String decodeFlightMode(uint32_t m) {
+    switch (m) {
+        case 0:  return "STABILIZE";
+        case 3:  return "AUTO";
+        case 4:  return "GUIDED";
+        case 5:  return "LOITER";
+        case 6:  return "RTL";
+        default: return "UNKNOWN";
+    }
+}
 
 // =======================
 // 🛰️ Filtro GPS (tu versión)
@@ -143,6 +154,7 @@ int           maxRetries   = 4;
 unsigned long nextMsgCounter = 0;
 
 // =======================
+// =======================
 // 🧭 Máquina de estados
 // =======================
 enum DroneState {
@@ -160,48 +172,49 @@ enum DroneState {
 };
 
 DroneState state = IDLE;
-unsigned long stateEntryTime   = 0;
+unsigned long stateEntryTime    = 0;
 unsigned long insideRadiusSince = 0;
+
+// Para control del STATUS
+DroneState lastSentState = IDLE;
+bool statusDirty         = true;
+
 void resetMissionState();
 void sendStatusToGS(DroneState st);
-
 
 // ============================================================================
 // 📡 Enviar estado de la FSM a la Ground Station
 // ============================================================================
-String stateToString(DroneState s) {
+// Convierte el estado de la FSM a texto legible
+String fsmStateToString(int s) {
   switch (s) {
-    case IDLE:          return "IDLE";
-    case TAKEOFF:       return "TAKEOFF";
-    case NAVIGATE:      return "NAVIGATE";
-    case STABILIZE:     return "STABILIZE";
-    case WAIT_ANALYSIS: return "WAIT_ANALYSIS";
-    case RETURN_HOME:   return "RETURN_HOME";
-    case LAND:          return "LAND";
-    case COMPLETE:      return "COMPLETE";
-    default:            return "UNKNOWN";
+    case IDLE:              return "IDLE";
+    case ARMING:            return "ARMING";
+    case READY_FOR_MISSION: return "READY_FOR_MISSION";
+    case PREPARE_TAKEOFF:   return "PREPARE_TAKEOFF";
+    case TAKEOFF:           return "TAKEOFF";
+    case NAVIGATE:          return "NAVIGATE";
+    case STABILIZE:         return "STABILIZE";
+    case WAIT_ANALYSIS:     return "WAIT_ANALYSIS";
+    case RETURN_HOME:       return "RETURN_HOME";
+    case LAND:              return "LAND";
+    case COMPLETE:          return "COMPLETE";
+    default:                return "UNKNOWN";
   }
 }
-
-DroneState lastSentState = IDLE;   // estado anterior enviado
-bool statusDirty = true;           // fuerza envío inicial si querés
-
 
 void sendStatusToGS(DroneState st) {
 
   if (st == lastSentState && !statusDirty)
-    return;  // ⛔ Ya se envió este estado → no repetir
+    return;
 
   lastSentState = st;
-  statusDirty = false;  // ahora ya está sincronizado
+  statusDirty   = false;
 
   StaticJsonDocument<128> doc;
-  doc["t"] = "STATUS";
-
-  //JsonObject d = doc.createNestedObject("d");
-  doc["message"] = stateToString(st);
-
-  doc["ts"] = millis();
+  doc["t"]       = "STATUS";
+  doc["message"] = fsmStateToString((int)st);
+  doc["ts"]      = millis();
 
   String payload;
   serializeJson(doc, payload);
@@ -211,8 +224,10 @@ void sendStatusToGS(DroneState st) {
   LoRa.print(frame);
   LoRa.endPacket();
 
-  Serial.println("📤 STATUS enviado: " + stateToString(st));
+  Serial.println("📤 STATUS enviado: " + fsmStateToString((int)st));
 }
+
+
 
 
 // Análisis RPi
@@ -459,14 +474,20 @@ void sendJsonNoAckToGS(const JsonDocument &doc) {
 void sendTelemetry(double lat,double lon,double alt,double speed,double heading,unsigned long ts) {
   StaticJsonDocument<256> doc;
   doc["t"] = "TELEMETRY";
+
   JsonObject d = doc.createNestedObject("d");
   d["lat"]     = lat;
   d["lon"]     = lon;
   d["alt"]     = alt;
   d["speed"]   = speed;
   d["heading"] = heading;
-  d["battery"] = 0;
-  d["status"]  = 0;
+
+  // Datos reales desde MAVLink
+  d["battery"] = mav_batt_remaining;      // %
+  d["voltage"] = mav_batt_voltage;        // V
+  d["armed"]   = mav_armed;               // true/false
+  d["mode"]    = decodeFlightMode(mav_custom_mode);
+
   doc["ts"]    = ts;
 
   String p;
@@ -477,6 +498,7 @@ void sendTelemetry(double lat,double lon,double alt,double speed,double heading,
   LoRa.print(msg);
   LoRa.endPacket();
 }
+
 
 void sendEventToGS(const String &topic, double lat, double lon, double alt,
                    unsigned long ts, float confidence) {
@@ -1116,7 +1138,7 @@ void generateMissionPath(Mission& m) {
   Coordinate end   = m.polygon[0];
 
   double totalDist = haversineDistance(start.lat, start.lon, end.lat, end.lon);
-  int steps = (m.spacing > 0.5) ? (int)(totalDist / m.spacing) : 1;
+  int steps = (m.spacing > 11) ? (int)(totalDist / m.spacing) : 1;
   if (steps < 1) steps = 1;
 
   for (int i = 0; i <= steps; i++) {
@@ -1660,10 +1682,12 @@ void resetMissionState() {
   loraDisarmCommand   = false;
   state               = IDLE;
 
-  statusDirty = true; // <- IMPORTANTE: reset de status FSM
+  statusDirty = true;          // forzamos reenvío
+  sendStatusToGS(state);       // avisamos a la GS que volvimos a IDLE
 
   Serial.println("🔄 Estado reiniciado (IDLE)");
 }
+
 
 void requestMavlinkStreams() {
   // Request GLOBAL_POSITION_INT (ID 33)
