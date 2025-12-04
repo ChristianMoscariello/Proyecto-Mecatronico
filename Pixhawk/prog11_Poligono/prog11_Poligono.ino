@@ -63,12 +63,12 @@ unsigned long armingConfirmationDeadline = 0;
 Servo actionServo;
 
 const int SERVO_PIN = 25;      // GPIO donde conectás el servo
-const int SERVO_CLOSED = 0;    // grados (cerrado)
-const int SERVO_OPEN   = 90;   // grados (abierto)
+const int SERVO_CLOSED = 35;    // grados (cerrado)
+const int SERVO_OPEN   = 105;   // grados (abierto)
 
 bool servoActive = false;
 unsigned long servoOpenStartMs = 0;
-const unsigned long SERVO_OPEN_TIME = 10000;  // 10 segundos
+const unsigned long SERVO_OPEN_TIME = 2000;  // 2 segundos
 
 // ============================================================================
 // 📌 ESTRUCTURAS Y ESTADO GLOBAL
@@ -332,6 +332,80 @@ void filterGPS(double lat, double lon, double alt,
 double deg2rad(double deg) { return deg * M_PI / 180.0; }
 double rad2deg(double rad) { return rad * 180.0 / M_PI; }
 
+// ===============================================================
+// Conversión grados <-> metros
+// ===============================================================
+double degLatToMeters(double deg) { return deg * 111320.0; }
+double degLonToMeters(double deg, double lat) { return deg * (111320.0 * cos(lat * M_PI / 180.0)); }
+double metersToDegLat(double m) { return m / 111320.0; }
+double metersToDegLon(double m, double lat) { return m / (111320.0 * cos(lat * M_PI / 180.0)); }
+
+// ===============================================================
+// Punto dentro del polígono (Ray Casting)
+// ===============================================================
+bool pointInPolygon(const vector<Coordinate> &poly, double lat, double lon) {
+    bool inside = false;
+    int n = poly.size();
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        double xi = poly[i].lat, yi = poly[i].lon;
+        double xj = poly[j].lat, yj = poly[j].lon;
+
+        bool intersect = ((yi > lon) != (yj > lon)) &&
+                         (lat < (xj - xi) * (lon - yi) / (yj - yi) + xi);
+
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+// ===============================================================
+// Generación de WP dentro de un polígono
+// ===============================================================
+vector<Coordinate> generatePolygonWPs(
+    const vector<Coordinate> &poly,
+    double camWidth_m,
+    double camHeight_m,
+    double overlap,
+    int maxWp
+) {
+    vector<Coordinate> result;
+    if (poly.size() < 3) return result;
+
+    double minLat=1e9, maxLat=-1e9;
+    double minLon=1e9, maxLon=-1e9;
+
+    for (auto &p : poly) {
+        if (p.lat < minLat) minLat = p.lat;
+        if (p.lat > maxLat) maxLat = p.lat;
+        if (p.lon < minLon) minLon = p.lon;
+        if (p.lon > maxLon) maxLon = p.lon;
+    }
+
+    double spacing_m = camHeight_m * (1.0 - overlap);
+    if (spacing_m < 1.0) spacing_m = 1.0;
+
+    for (double lat = minLat; lat <= maxLat; lat += metersToDegLat(spacing_m)) {
+        bool leftToRight = ((int)result.size() % 2 == 0);
+        vector<Coordinate> line;
+
+        for (double lon = minLon; lon <= maxLon; lon += metersToDegLon(camWidth_m, lat)) {
+            if (pointInPolygon(poly, lat, lon)) {
+                Coordinate c; c.lat = lat; c.lon = lon;
+                line.push_back(c);
+            }
+        }
+
+        if (!leftToRight) reverse(line.begin(), line.end());
+        for (auto &p : line) {
+            if ((int)result.size() >= maxWp) return result;
+            result.push_back(p);
+        }
+    }
+
+    return result;
+}
+
+
 double haversineDistance(double la1, double lo1, double la2, double lo2) {
   double R = 6371000.0;
   double dLat = deg2rad(la2 - la1);
@@ -567,239 +641,269 @@ bool extractNextFrame(String &buf, String &jsonOut, const char* wantedHdr) {
   return true;
 }
 
-// ============================================================================
-// 📥 PROCESAMIENTO DE JSON DESDE GS O RPi
-// ============================================================================
 void processIncomingJSON(const String &jsonIn, bool fromGS) {
-  StaticJsonDocument<1024> doc;
 
-  if (deserializeJson(doc, jsonIn)) {
-    Serial.println("❌ JSON inválido");
-    return;
-  }
+    StaticJsonDocument<1024> doc;
 
-  const char* type  = doc["t"]  | "";
-  const char* msgId = doc["id"] | "";
-
-  Serial.println("📥 [processIncomingJSON] " + jsonIn);
-
-  // ------------------------------------------------------------------
-  // 1) MENSAJES DESDE LA GROUND STATION
-  // ------------------------------------------------------------------
-  if (fromGS) {
-
-    // -------------------------------
-    // ACK desde GS
-    // -------------------------------
-    if (strcmp(type, "ACK") == 0) {
-      String id = "";
-      if (doc.containsKey("d")) id = doc["d"]["id"] | "";
-      if (id != "") handleAck(id);
-      return;
-    }
-
-    // ==========================================================
-    //  ⭐ SIM_ON → activar testMode + simulación
-    // ==========================================================
-    if (strcmp(type, "SIM_ON") == 0) {
-      simulationMode = true;
-      testMode      = true;   // << activar modo test
-      mav_armed     = true;   // << finge que está armado
-      Serial.println("🧪 MODO TEST + SIMULACIÓN ACTIVADOS");
-      sendAckToGS(msgId);
-      return;
-    }
-
-    // ==========================================================
-    //  ⭐ SIM_OFF → desactivar testMode + simulación
-    // ==========================================================
-    if (strcmp(type, "SIM_OFF") == 0) {
-      simulationMode = false;
-      testMode      = false;
-      mav_armed     = false;   // opcional: volvemos a "no armado"
-      Serial.println("🛑 MODO TEST DESACTIVADO");
-      sendAckToGS(msgId);
-      return;
-    }
-
-    // ==========================================================
-    //  ARM → en testMode se simula el ARM
-    // ==========================================================
-    if (strcmp(type, "ARM") == 0) {
-
-      Serial.println("📡 GS → ARM solicitado");
-
-      // 1) Siempre GUIDED antes de armar (solo en modo real)
-      if (!testMode) {
-        setModeGuided();
-        delay(150);
-      }
-
-      // -------------------------
-      // ⭐ MODO TEST → NO ARMAR REAL
-      // -------------------------
-      if (testMode) {
-        Serial.println("🛑 [TEST] ARM ignorado. Simulando armado.");
-        mav_armed = true;     // SIMULA ARM REAL
-      } else {
-        pixhawkArm(true);     // ARM REAL
-      }
-
-      // Estado ARMING
-      state = ARMING;
-      stateEntryTime = millis();
-      sendStatusToGS(state);
-
-      // Fast confirm
-      armingConfirmationDeadline = millis() + 2000;
-      awaitingFastArmConfirm     = true;
-
-      // Confirmación instantánea
-      if (mav_armed) {
-        Serial.println("✔ ARM confirmado (real o simulado)");
-        state = READY_FOR_MISSION;
-        sendStatusToGS(state);
-      }
-
-      return;
-    }
-
-    // ==========================================================
-    // DISARM
-    // ==========================================================
-    if (strcmp(type, "DISARM") == 0) {
-      Serial.println("🛑 GS → DISARM");
-
-      if (!testMode) {
-        pixhawkDisarmForce();
-        delay(50);
-        pixhawkDisarmForce();
-      }
-
-      loraDisarmCommand = true;
-      sendAckToGS(msgId);
-
-      state = IDLE;
-      sendStatusToGS(state);
-      return;
-    }
-
-    // ==========================================================
-    // RETURN
-    // ==========================================================
-    if (strcmp(type, "RETURN") == 0) {
-      Serial.println("↩️ RETURN recibido");
-
-      loraReturnCommand = true;
-      state = RETURN_HOME;
-      sendAckToGS(msgId);
-
-      // ⭐ Enviamos GOTO inmediato a HOME para que el Pix empiece a irse
-      if (mission.loaded) {
-        sendMavGoto(mission.home.lat, mission.home.lon, mission.altitude);
-      }
-
-      return;
-    }
-
-    // ==========================================================
-    // MISSION_COMPACT → ruta + takeoff nativo → FSM: TAKEOFF
-    // ==========================================================
-    if (strcmp(type, "MISSION_COMPACT") == 0) {
-      Serial.println("📦 RX MISSION_COMPACT");
-
-      JsonObject d = doc["d"];
-      if (d.isNull()) {
-        Serial.println("❌ Campo d faltante");
+    if (deserializeJson(doc, jsonIn)) {
+        Serial.println("❌ JSON inválido");
         return;
-      }
-
-      mission.polygon.clear();
-
-      JsonArray p = d["p"];
-      if (!p.isNull()) {
-        for (JsonArray::iterator it = p.begin(); it != p.end(); ++it) {
-          JsonArray coord = (*it).as<JsonArray>();
-          if (coord.size() == 2) {
-            Coordinate pt;
-            pt.lat = coord[0];
-            pt.lon = coord[1];
-            mission.polygon.push_back(pt);
-          }
-        }
-      }
-
-      JsonArray h = d["h"];
-      if (!h.isNull() && h.size() == 2) {
-        mission.home.lat = h[0];
-        mission.home.lon = h[1];
-      }
-
-      mission.altitude     = d["a"] | 20.0;
-      mission.spacing      = d["s"] | 10.0;
-      mission.event_action = d["event_action"] | "NONE";
-      mission.loaded       = true;
-
-      generateMissionPath(mission);
-      sendAckToGS(msgId);
-      if (!pathPoints.empty())
-        sendActiveWaypointToGS(0, pathPoints[0]);
-
-      // TAKEOFF real o simulado
-      Serial.println("🚁 TAKEOFF NATIVO → GUIDED");
-      if (!testMode) setModeGuided();
-
-      if (testMode) {
-        Serial.println("🛫 [TEST] TAKEOFF simulado");
-      } else {
-        pixhawkTakeoff(mission.altitude);
-      }
-
-      state = TAKEOFF;
-      stateEntryTime = millis();
-      return;
     }
 
-  } // <-- cierra if (fromGS)
+    const char* type  = doc["t"]  | "";
+    const char* msgId = doc["id"] | "";
 
+    Serial.println("📥 [processIncomingJSON] " + jsonIn);
 
+    // ==========================================================
+    // 1) MENSAJES DESDE LA GROUND STATION
+    // ==========================================================
+    if (fromGS) {
 
+        // ------------------------------------------------------
+        // ACK
+        // ------------------------------------------------------
+        if (strcmp(type, "ACK") == 0) {
+            String id = "";
+            if (doc.containsKey("d"))
+                id = doc["d"]["id"] | "";
 
-  // ------------------------------------------------------------------
-  // 2) MENSAJES DESDE LA RPi (EVENTOS)
-  // ------------------------------------------------------------------
-  if (strcmp(type, "GO") == 0) {
-    analysisResult = GO;
-    Serial.println("📩 [RPI] GO");
-    return;
-  }
+            if (id != "")
+                handleAck(id);
 
-  if (strcmp(type, "FIRE") == 0) {
-    analysisResult = FIRE;
+            return;
+        }
 
-    float confidence = -1;
-    if (doc.containsKey("confidence")) confidence = doc["confidence"];
-    else if (doc.containsKey("d") && doc["d"].containsKey("confidence"))
-      confidence = doc["d"]["confidence"];
+        // ------------------------------------------------------
+        // SIM_ON
+        // ------------------------------------------------------
+        if (strcmp(type, "SIM_ON") == 0) {
+            simulationMode = true;
+            testMode       = true;
+            mav_armed      = true;
 
-    sendEventToGS("FIRE", mav_lat, mav_lon, mav_alt_rel, millis(), confidence);
-    return;
-  }
+            Serial.println("🧪 MODO TEST + SIMULACIÓN ACTIVADOS");
+            sendAckToGS(msgId);
+            return;
+        }
 
-  if (strcmp(type, "PERSON") == 0) {
-    analysisResult = PERSON;
+        // ------------------------------------------------------
+        // SIM_OFF
+        // ------------------------------------------------------
+        if (strcmp(type, "SIM_OFF") == 0) {
+            simulationMode = false;
+            testMode       = false;
+            mav_armed      = false;
 
-    float confidence = -1;
-    if (doc.containsKey("confidence")) confidence = doc["confidence"];
-    else if (doc.containsKey("d") && doc["d"].containsKey("confidence"))
-      confidence = doc["d"]["confidence"];
+            Serial.println("🛑 MODO TEST DESACTIVADO");
+            sendAckToGS(msgId);
+            return;
+        }
 
-    sendEventToGS("PERSON", mav_lat, mav_lon, mav_alt_rel, millis(), confidence);
-    return;
-  }
+        // ------------------------------------------------------
+        // ARM
+        // ------------------------------------------------------
+        if (strcmp(type, "ARM") == 0) {
 
-  Serial.printf("⚠️ Tipo desconocido: %s\n", type);
+            Serial.println("📡 GS → ARM solicitado");
+
+            if (!testMode) {
+                setModeGuided();
+                delay(150);
+            }
+
+            if (testMode) {
+                Serial.println("🛑 [TEST] ARM ignorado. Simulamos armado.");
+                mav_armed = true;
+            } else {
+                pixhawkArm(true);
+            }
+
+            state = ARMING;
+            stateEntryTime = millis();
+            sendStatusToGS(state);
+
+            armingConfirmationDeadline = millis() + 2000;
+            awaitingFastArmConfirm     = true;
+
+            if (mav_armed) {
+                Serial.println("✔ ARM confirmado (real o simulado)");
+                state = READY_FOR_MISSION;
+                sendStatusToGS(state);
+            }
+
+            return;
+        }
+
+        // ------------------------------------------------------
+        // DISARM
+        // ------------------------------------------------------
+        if (strcmp(type, "DISARM") == 0) {
+
+            Serial.println("🛑 GS → DISARM");
+
+            if (!testMode) {
+                pixhawkDisarmForce();
+                delay(50);
+                pixhawkDisarmForce();
+            }
+
+            loraDisarmCommand = true;
+            sendAckToGS(msgId);
+
+            state = IDLE;
+            sendStatusToGS(state);
+            return;
+        }
+
+        // ------------------------------------------------------
+        // RETURN
+        // ------------------------------------------------------
+        if (strcmp(type, "RETURN") == 0) {
+
+            Serial.println("↩️ RETURN recibido");
+
+            loraReturnCommand = true;
+            state = RETURN_HOME;
+
+            sendAckToGS(msgId);
+
+            if (mission.loaded) {
+                sendMavGoto(mission.home.lat, mission.home.lon, mission.altitude);
+            }
+
+            return;
+        }
+
+        // ------------------------------------------------------
+        // MISSION_COMPACT  (versión corregida)
+        // ------------------------------------------------------
+        if (strcmp(type, "MISSION_COMPACT") == 0) {
+
+            Serial.println("📦 RX MISSION_COMPACT");
+
+            JsonObject d = doc["d"];
+            if (d.isNull()) {
+                Serial.println("❌ Campo d faltante");
+                return;
+            }
+
+            // ----- Leer polígono -----
+            mission.polygon.clear();
+
+            JsonArray p = d["p"];
+            if (!p.isNull()) {
+                for (JsonArray::iterator it = p.begin(); it != p.end(); ++it) {
+                    JsonArray coord = (*it).as<JsonArray>();
+                    if (coord.size() == 2) {
+                        Coordinate pt;
+                        pt.lat = coord[0];
+                        pt.lon = coord[1];
+                        mission.polygon.push_back(pt);
+                    }
+                }
+            }
+
+            // ----- HOME -----
+            JsonArray h = d["h"];
+            if (!h.isNull() && h.size() == 2) {
+                mission.home.lat = h[0];
+                mission.home.lon = h[1];
+            }
+
+            // ----- Parámetros -----
+            mission.altitude     = d["a"] | 20.0;
+            mission.spacing      = d["s"] | 10.0;
+            mission.event_action = d["event_action"] | "NONE";
+            mission.loaded       = true;
+
+            // --------------------------------------------------
+            // Generar WPs dentro del polígono
+            // --------------------------------------------------
+            double camWidth  = 5.0;
+            double camHeight = 7.0;
+            double overlap   = 0.30;
+
+            pathPoints = generatePolygonWPs(
+                mission.polygon,
+                camWidth,
+                camHeight,
+                overlap,
+                40  // límite
+            );
+
+            // Enviar todos los WPs
+            sendWaypointsBulkToGS(pathPoints);
+
+            // ACK
+            sendAckToGS(msgId);
+
+            // WP inicial a GS
+            if (!pathPoints.empty())
+                sendActiveWaypointToGS(0, pathPoints[0]);
+
+            // --------------------------------------------------
+            // Takeoff nativo
+            // --------------------------------------------------
+            Serial.println("🚁 TAKEOFF NATIVO → GUIDED");
+
+            if (!testMode)
+                setModeGuided();
+
+            if (testMode) {
+                Serial.println("🛫 [TEST] TAKEOFF simulado");
+            } else {
+                pixhawkTakeoff(mission.altitude);
+            }
+
+            state = TAKEOFF;
+            stateEntryTime = millis();
+            sendStatusToGS(state);
+
+            return;
+        }
+    }
+
+    // ==========================================================
+    // 2) MENSAJES DESDE LA RASPBERRY PI
+    // ==========================================================
+    if (strcmp(type, "GO") == 0) {
+        analysisResult = GO;
+        Serial.println("📩 [RPI] GO");
+        return;
+    }
+
+    if (strcmp(type, "FIRE") == 0) {
+
+        analysisResult = FIRE;
+
+        float conf = -1;
+        if (doc.containsKey("confidence")) 
+            conf = doc["confidence"];
+        else if (doc.containsKey("d") && doc["d"].containsKey("confidence"))
+            conf = doc["d"]["confidence"];
+
+        sendEventToGS("FIRE", mav_lat, mav_lon, mav_alt_rel, millis(), conf);
+        return;
+    }
+
+    if (strcmp(type, "PERSON") == 0) {
+
+        analysisResult = PERSON;
+
+        float conf = -1;
+        if (doc.containsKey("confidence")) 
+            conf = doc["confidence"];
+        else if (doc.containsKey("d") && doc["d"].containsKey("confidence"))
+            conf = doc["d"]["confidence"];
+
+        sendEventToGS("PERSON", mav_lat, mav_lon, mav_alt_rel, millis(), conf);
+        return;
+    }
+
+    Serial.printf("⚠️ Tipo desconocido: %s\n", type);
 }
+
 // ============================================================================
 // 📡 TELEMETRÍA PERIÓDICA HACIA GS
 // ============================================================================
@@ -1300,6 +1404,30 @@ void sendActiveWaypointToGS(int wp, const Coordinate& pt) {
     Serial.printf("📤 [GS] WP_UPDATE → wp=%d (%.6f, %.6f)\n", wp, pt.lat, pt.lon);
 }
 
+// ===============================================================
+// Enviar todos los WP a la GS en un solo paquete
+// ===============================================================
+void sendWaypointsBulkToGS(const vector<Coordinate> &wps) {
+    StaticJsonDocument<2048> doc;
+    doc["t"] = "WAYPOINTS_BULK";
+    doc["count"] = wps.size();
+
+    JsonArray arr = doc.createNestedArray("wps");
+
+    for (auto &p : wps) {
+        JsonObject o = arr.createNestedObject();
+        o["lat"] = p.lat;
+        o["lon"] = p.lon;
+    }
+
+    String payload;
+    serializeJson(doc, payload);
+
+    String frame = String(UAV_HDR) + payload + SFX;
+    sendWithAck(frame, generateMsgID());
+
+    Serial.printf("📤 WAYPOINTS_BULK enviado (%d WP)\n", wps.size());
+}
 
 void notifyWaypointReached(int wp) {
   StaticJsonDocument<128> doc;
