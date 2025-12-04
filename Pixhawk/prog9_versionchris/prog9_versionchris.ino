@@ -1646,6 +1646,7 @@ void updateStateMachine() {
       break;
   }
 }
+
 void simulateDroneMotion() {
   if (!simulationMode || !mission.loaded) return;
 
