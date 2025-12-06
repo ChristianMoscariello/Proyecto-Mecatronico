@@ -6,8 +6,7 @@
 #include <math.h>
 #include <vector>
 #include <HardwareSerial.h>
-#include <MAVLink.h>   // Librería de Oleg Kalachev
-//#include <MAVlink/mavlink/ardupilotmega/mavlink.h>
+#include <MAVLink.h>   
 #include <ESP32Servo.h>
 
 using std::vector;
@@ -346,6 +345,47 @@ double computeBearing(double la1, double lo1, double la2, double lo2) {
   double brng = atan2(y, x);
   return fmod((rad2deg(brng) + 360.0), 360.0);
 }
+
+// =====================================
+// ORDENAMIENTO ROBUSTO DEL POLÍGONO (CW)
+// =====================================
+std::vector<Coordinate> orderPolygonPoints(const std::vector<Coordinate>& pts)
+{
+    if (pts.size() < 3) return pts;
+
+    // Calcular centroide
+    double cx = 0, cy = 0;
+    for (auto& p : pts) {
+        cx += p.lat;
+        cy += p.lon;
+    }
+    cx /= pts.size();
+    cy /= pts.size();
+
+    // Orden CCW por ángulo polar
+    std::vector<Coordinate> ordered = pts;
+    std::sort(ordered.begin(), ordered.end(),
+        [&](const Coordinate& a, const Coordinate& b) {
+            return atan2(a.lon - cy, a.lat - cx) < atan2(b.lon - cy, b.lat - cx);
+        }
+    );
+
+    // Determinar orientación (área firmada)
+    double area = 0;
+    for (int i = 0; i < ordered.size(); i++) {
+        double x1 = ordered[i].lat, y1 = ordered[i].lon;
+        double x2 = ordered[(i + 1) % ordered.size()].lat, y2 = ordered[(i + 1) % ordered.size()].lon;
+        area += (x2 - x1) * (y2 - y1);
+    }
+
+    // Si CCW → invertir para obtener CW
+    if (area > 0) {
+        std::reverse(ordered.begin(), ordered.end());
+    }
+
+    return ordered;
+}
+
 
 // ============================================================================
 // 📡 ACKs LoRa – helpers
@@ -700,6 +740,37 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
     }
 
     // ==========================================================
+    // GRIPPER desde GS: OPEN / CLOSE
+    // ==========================================================
+    if (strcmp(type, "GRIPPER") == 0) {
+
+        if (!doc.containsKey("d") || !doc["d"].containsKey("state")) {
+            Serial.println("⚠️ GRIPPER sin campo 'state'");
+            sendAckToGS(msgId);
+            return;
+        }
+
+        const char* st = doc["d"]["state"];
+
+        if (strcmp(st, "OPEN") == 0) {
+            Serial.println("🟢 [GS] GRIPPER OPEN");
+            actionServo.write(SERVO_OPEN);
+            servoActive = false;  // desactiva auto-cierre automático
+        }
+        else if (strcmp(st, "CLOSE") == 0) {
+            Serial.println("🔴 [GS] GRIPPER CLOSE");
+            actionServo.write(SERVO_CLOSED);
+            servoActive = false;  // detiene countdown si estaba activo
+        }
+        else {
+            Serial.printf("⚠️ GRIPPER state desconocido: %s\n", st);
+        }
+
+        sendAckToGS(msgId);
+        return;
+    }
+
+    // ==========================================================
     // MISSION_COMPACT → ruta + takeoff nativo → FSM: TAKEOFF
     // ==========================================================
     if (strcmp(type, "MISSION_COMPACT") == 0) {
@@ -725,6 +796,8 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
           }
         }
       }
+      // ORDENAMIENTO ROBUSTO DEL POLÍGONO
+      mission.polygon = orderPolygonPoints(mission.polygon);
 
       JsonArray h = d["h"];
       if (!h.isNull() && h.size() == 2) {
@@ -1178,63 +1251,249 @@ void readMavlink() {
   }   // end while
 }
 
-// ============================================================================
-// 🧭 GENERACIÓN DE WAYPOINTS (HOME → primer vértice)
-// ============================================================================
+// =======================================================================================
+// 🧭 GENERADOR LAWN MOWER: ROTACIÓN + SUBDIVISIÓN ds + TURNING POINTS + FILTRADO + SMOOTH
+// =======================================================================================
 void generateMissionPath(Mission& m) {
+
     pathPoints.clear();
-    if (m.polygon.size() < 1) return;
 
-    Coordinate start = m.home;
-    Coordinate end   = m.polygon[0];
-
-    // Distancias
-    double totalDist = haversineDistance(start.lat, start.lon, end.lat, end.lon);
-
-    // Seguridad: evitar WP pegado al home
-    const double MIN_START_DIST = 12.0;  // metros
-    if (totalDist < MIN_START_DIST) {
-        Serial.printf("⚠️ Primer punto muy cerca del HOME (%.1f m). Ajustando...\n", totalDist);
-
-        double ratio = MIN_START_DIST / totalDist;
-        end.lat = start.lat + (end.lat - start.lat) * ratio;
-        end.lon = start.lon + (end.lon - start.lon) * ratio;
-
-        totalDist = MIN_START_DIST;
+    if (m.polygon.size() < 4) {
+        Serial.println("❌ ERROR: se requieren 4 vértices para lawnmower.");
+        return;
     }
 
-    int steps = (m.spacing > 0.5) ? (int)(totalDist / m.spacing) : 1;
-    if (steps < 1) steps = 1;
+    // ---------------------------------------
+    // CONFIGURACIÓN DEL ALGORITMO
+    // ---------------------------------------
+    double TURN_RADIUS = 3.0;     // metros para suavizar curvas
+    double MIN_WP_DIST = 1.5;     // distancia mínima entre waypoints
+    double ds = (m.detect_spacing < 1.0) ? 1.0 : m.detect_spacing;
 
-    // IMPORTANTE: comenzamos en i=1 para NO agregar HOME como WP
-    for (int i = 1; i <= steps; i++) {
-        double t = (double)i / (double)steps;
-        Coordinate pt;
-        pt.lat = start.lat + (end.lat - start.lat) * t;
-        pt.lon = start.lon + (end.lon - start.lon) * t;
-        pathPoints.push_back(pt);
+    // ---------------------------------------
+    // Funciones auxiliares ENU<->Coordinate
+    // ---------------------------------------
+    const double R = 6378137.0;
+    double lat0 = deg2rad(m.home.lat);
+    double lon0 = deg2rad(m.home.lon);
+
+    auto toLocal = [&](double lat, double lon) {
+        double dLat = deg2rad(lat) - lat0;
+        double dLon = deg2rad(lon) - lon0;
+        double y = dLat * R;
+        double x = dLon * R * cos(lat0);
+        return std::pair<double,double>(x,y);
+    };
+
+    auto toGlobal = [&](double x, double y) {
+        Coordinate c;
+        c.lat = rad2deg(lat0 + (y / R));
+        c.lon = rad2deg(lon0 + (x / (R * cos(lat0))));
+        return c;
+    };
+
+    // ---------------------------------------
+    // 1) Polígono local
+    // ---------------------------------------
+    vector<std::pair<double,double>> poly;
+    for (auto &p : m.polygon)
+        poly.push_back(toLocal(p.lat, p.lon));
+
+    int N = poly.size();
+
+    // ---------------------------------------
+    // 2) Hallar el lado más largo
+    // ---------------------------------------
+    int iLongest = 0;
+    double maxDist = -1;
+
+    for (int i = 0; i < N; i++) {
+        int j = (i + 1) % N;
+        double dx = poly[j].first  - poly[i].first;
+        double dy = poly[j].second - poly[i].second;
+        double d  = sqrt(dx*dx + dy*dy);
+        if (d > maxDist) {
+            maxDist = d;
+            iLongest = i;
+        }
     }
 
-    // Seguridad al final: evitar que último WP quede pegado al HOME
-    const double MIN_END_DIST = 12.0;
-    Coordinate last = pathPoints.back();
-    double endDist = haversineDistance(last.lat, last.lon, m.home.lat, m.home.lon);
+    int i0 = iLongest;
+    int i1 = (iLongest + 1) % N;
 
-    if (endDist < MIN_END_DIST) {
-        Serial.printf("⚠️ Último WP demasiado cerca del HOME (%.1f m). Ajustando...\n", endDist);
+    double dx = poly[i1].first  - poly[i0].first;
+    double dy = poly[i1].second - poly[i0].second;
 
-        double ratio = MIN_END_DIST / endDist;
-        last.lat = m.home.lat + (last.lat - m.home.lat) * ratio;
-        last.lon = m.home.lon + (last.lon - m.home.lon) * ratio;
-        pathPoints.back() = last;
+    double theta = atan2(dy, dx);
+
+    // ---------------------------------------
+    // 3) Rotaciones
+    // ---------------------------------------
+    auto rot = [&](double x, double y) {
+        return std::pair<double,double>(
+            x*cos(theta) + y*sin(theta),
+           -x*sin(theta) + y*cos(theta)
+        );
+    };
+
+    auto unrot = [&](double xr, double yr) {
+        return std::pair<double,double>(
+            xr*cos(theta) - yr*sin(theta),
+            xr*sin(theta) + yr*cos(theta)
+        );
+    };
+
+    // ---------------------------------------
+    // 4) Polígono rotado
+    // ---------------------------------------
+    vector<std::pair<double,double>> polyR;
+    for (auto &p : poly)
+        polyR.push_back(rot(p.first, p.second));
+
+    // ---------------------------------------
+    // 5) Límites verticales
+    // ---------------------------------------
+    double ymin =  1e9, ymax = -1e9;
+
+    for (auto &p : polyR) {
+        ymin = min(ymin, p.second);
+        ymax = max(ymax, p.second);
     }
 
+    double spacing = max(2.0, m.spacing);
+    int numLines = (int)((ymax - ymin) / spacing) + 2;
+
+    // ---------------------------------------
+    // Función intersección línea horizontal con polígono
+    // ---------------------------------------
+    auto intersect = [&](double yL) {
+        vector<std::pair<double,double>> pts;
+        for (int i = 0; i < N; i++) {
+            int j = (i + 1) % N;
+
+            auto A = polyR[i];
+            auto B = polyR[j];
+
+            double yA = A.second;
+            double yB = B.second;
+
+            if ((yL >= yA && yL <= yB) || (yL >= yB && yL <= yA)) {
+                if (fabs(yB - yA) < 1e-6) continue;
+
+                double u = (yL - yA) / (yB - yA);
+                double x = A.first + (B.first - A.first) * u;
+                pts.push_back({x, yL});
+            }
+        }
+        return pts;
+    };
+
+    // ---------------------------------------
+    // 6) Generación de serpiente + turning points
+    // ---------------------------------------
+    bool reverse = false;
+    vector<std::pair<double,double>> raw;  // puntos ENU rotados
+
+    for (int k = 0; k < numLines; k++) {
+
+        double yL = ymin + k * spacing;
+        auto pts = intersect(yL);
+
+        if (pts.size() < 2) continue;
+
+        sort(pts.begin(), pts.end(), [](auto &a, auto &b){
+            return a.first < b.first;
+        });
+
+        auto A = pts.front();
+        auto B = pts.back();
+
+        if (reverse) std::swap(A, B);
+        reverse = !reverse;
+
+        // Longitud del tramo
+        double dxs = B.first - A.first;
+        double dys = B.second - A.second;
+        double segLen = sqrt(dxs*dxs + dys*dys);
+
+        if (segLen < 5.0) continue;
+
+        int n = max(1, (int)(segLen / ds));
+
+        // Subdivisión interna
+        for (int i = 0; i <= n; i++) {
+            double t = (double)i / n;
+            double xr = A.first  + dxs * t;
+            double yr = A.second + dys * t;
+            raw.push_back({xr, yr});
+        }
+
+        // Turning points (excepto última línea)
+        if (k + 1 < numLines) {
+            double xf = B.first;
+            double yf = B.second;
+
+            // B' → alejamos hacia afuera
+            double xB = xf + TURN_RADIUS * (dxs / segLen);
+            double yB = yf + TURN_RADIUS * (dys / segLen);
+            raw.push_back({xB, yB});
+        }
+    }
+
+    // ---------------------------------------
+    // 7) Un-rotate + to lat/lon
+    // ---------------------------------------
+    vector<Coordinate> wps;
+    for (auto &q : raw) {
+        auto p0 = unrot(q.first, q.second);
+        wps.push_back(toGlobal(p0.first, p0.second));
+    }
+
+    // ---------------------------------------
+    // 8) Filtrado de puntos cercanos
+    // ---------------------------------------
+    vector<Coordinate> filtered;
+    filtered.push_back(wps[0]);
+
+    for (int i = 1; i < wps.size(); i++) {
+        double d = haversineDistance(
+            filtered.back().lat, filtered.back().lon,
+            wps[i].lat, wps[i].lon
+        );
+        if (d > MIN_WP_DIST)
+            filtered.push_back(wps[i]);
+    }
+
+    // ---------------------------------------
+    // 9) Suavizado simple
+    // ---------------------------------------
+    for (int i = 1; i < filtered.size() - 1; i++) {
+        filtered[i].lat = 0.6 * filtered[i].lat +
+                          0.2 * filtered[i - 1].lat +
+                          0.2 * filtered[i + 1].lat;
+
+        filtered[i].lon = 0.6 * filtered[i].lon +
+                          0.2 * filtered[i - 1].lon +
+                          0.2 * filtered[i + 1].lon;
+    }
+
+    // ---------------------------------------
+    // 10) Insertar HOME al inicio
+    // ---------------------------------------
+    pathPoints.clear();
+    pathPoints.push_back(m.home);
+
+    for (auto &p : filtered)
+        pathPoints.push_back(p);
+
+    // ---------------------------------------
+    // 11) Enviar información a GS
+    // ---------------------------------------
     notifyWaypointCountToGS();
-    if (!pathPoints.empty()) 
-        sendActiveWaypointToGS(0, pathPoints[0]);
+    sendActiveWaypointToGS(0, pathPoints[0]);
 
-    Serial.printf("🧭 %d waypoints generados (spacing=%.1f m)\n",
-                  (int)pathPoints.size(), m.spacing);
+    Serial.printf("🧭 %d WAYPOINTS GENERADOS (lawnmower+ds+turn)\n",
+                  (int)pathPoints.size());
 }
 
 
@@ -1245,9 +1504,9 @@ void notifyWaypointCountToGS() {
   doc["ts"] = millis();
   if (!pathPoints.empty()) {
       doc["wp0"]["lat"] = pathPoints[0].lat;
-      doc["wp0"]["lon"] = pathPoints[0].lon;
+      doc["wp0"]["lon"] = pathPoints[0].lon;}
   
-  sendActiveWaypointToGS(0, pathPoints[0]);}
+  sendActiveWaypointToGS(0, pathPoints[0]);
   String payload;
   serializeJson(doc, payload);
   String frame = String(UAV_HDR) + payload + String(SFX);
@@ -1602,68 +1861,56 @@ void updateStateMachine() {
 
     // -------------------------------------------------------------------------
     case WAIT_ANALYSIS: {
-        
-        // ✅ FIX 4: Verificar que analysisStartTime está inicializado
-        if (analysisStartTime == 0) {
-            Serial.println("⚠️ analysisStartTime era 0, reiniciando");
-            analysisStartTime = millis();
-        }
 
         bool hasMore = (currentWaypoint + 1 < (int)pathPoints.size());
+        unsigned long elapsed = millis() - analysisStartTime;
 
-        // 🐛 DEBUG: Status del análisis cada 1s
-        static unsigned long lastAnalysisDebug = 0;
-        if (millis() - lastAnalysisDebug > 1000) {
-            unsigned long elapsed = millis() - analysisStartTime;
-           // Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-           // Serial.printf("📷 WAIT_ANALYSIS (WP %d)\n", currentWaypoint);
-           // Serial.printf("   Tiempo: %lu/%lu ms\n", elapsed, ANALYSIS_TIMEOUT);
-           // Serial.printf("   Resultado: %s\n", 
-                         //analysisResult == NONE ? "NONE" :
-                         //analysisResult == GO ? "GO" :
-                        // analysisResult == FIRE ? "FIRE" : "PERSON");
-           // Serial.printf("   Next WP: %s\n", hasMore ? "YES" : "NO (last)");
-           // Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-            lastAnalysisDebug = millis();
+        // ============================================================
+        // 1) PRIORIDADES MÁXIMAS
+        // ============================================================
+
+        // DISARM siempre primero
+        if (loraDisarmCommand) {
+            loraDisarmCommand = false;
+            if (!testMode) pixhawkArm(false);
+            resetMissionState();
+            break;
         }
 
-        // Procesar resultado
+        // RETURN siempre segundo
+        if (loraReturnCommand) {
+            loraReturnCommand = false;
+            state = RETURN_HOME;
+            sendStatusToGS(state);
+            break;
+        }
+
+        // ============================================================
+        // 2) RESULTADOS DESDE LA RPi
+        // ============================================================
+
         if (analysisResult != NONE) {
 
             if (analysisResult == GO) {
-                Serial.println("✅ RPi → GO");
                 currentWaypoint++;
-                
+
                 if (!hasMore) {
-                    Serial.println("   → Era el último WP → RETURN_HOME");
                     state = RETURN_HOME;
                 } else {
-                    Serial.printf("   → Siguiente WP %d: %.6f, %.6f\n",
-                                 currentWaypoint,
-                                 pathPoints[currentWaypoint].lat,
-                                 pathPoints[currentWaypoint].lon);
                     state = NAVIGATE;
                     sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
                 }
                 sendStatusToGS(state);
             }
+
             else if (analysisResult == FIRE || analysisResult == PERSON) {
-                
-                Serial.printf("🚨 RPi → %s\n", analysisResult == FIRE ? "FIRE" : "PERSON");
-                
-                if (analysisResult == PERSON) {
-                    Serial.println("   → Activando SERVO");
-                    triggerServoAction();
-                }
 
-                Serial.printf("   → Event action: %s\n", mission.event_action.c_str());
+                if (analysisResult == PERSON) triggerServoAction();
 
-                if (mission.event_action.equalsIgnoreCase("RETURN") || !hasMore) {
-                    Serial.println("   → RETURN_HOME");
+                if (!hasMore || mission.event_action.equalsIgnoreCase("RETURN")) {
                     state = RETURN_HOME;
                 } else {
                     currentWaypoint++;
-                    Serial.printf("   → CONTINUE → WP %d\n", currentWaypoint);
                     state = NAVIGATE;
                     sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
                 }
@@ -1674,26 +1921,38 @@ void updateStateMachine() {
             break;
         }
 
-        // ✅ FIX 5: Timeout mejorado con logs
-        unsigned long elapsed = millis() - analysisStartTime;
-        
-        if (elapsed > ANALYSIS_TIMEOUT) {
-            Serial.printf("⏱️ TIMEOUT análisis (%lu ms)\n", elapsed);
+        // ============================================================
+        // 3) EARLY AUTO-CONTINUE (para no frenar el dron innecesariamente)
+        // ============================================================
+
+        if (elapsed > 2000 && hasMore) {   // << early continue
             currentWaypoint++;
-            
-            if (!hasMore) {
-                Serial.println("   → Era el último WP → RETURN_HOME");
-                state = RETURN_HOME;
-            } else {
-                Serial.printf("   → TIMEOUT → WP %d: %.6f, %.6f\n",
-                             currentWaypoint,
-                             pathPoints[currentWaypoint].lat,
-                             pathPoints[currentWaypoint].lon);
+            state = NAVIGATE;
+            sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
+            sendStatusToGS(state);
+            break;
+        }
+
+        // ============================================================
+        // 4) TIMEOUT PRINCIPAL (seguridad)
+        // ============================================================
+
+        if (elapsed > ANALYSIS_TIMEOUT) {  // 6000 ms
+            currentWaypoint++;
+
+            if (!hasMore) state = RETURN_HOME;
+            else {
                 state = NAVIGATE;
                 sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
             }
+
             sendStatusToGS(state);
+            break;
         }
+
+        // ============================================================
+        // 5) Si no hay nada que hacer → esperar
+        // ============================================================
 
         break;
     }
