@@ -1258,7 +1258,10 @@ void generateMissionPath(Mission& m) {
 
     pathPoints.clear();
 
-    if (m.polygon.size() < 4) {
+    // 🔴 USAR SIEMPRE EL POLÍGONO ORDENADO
+    std::vector<Coordinate> orderedPoly = orderPolygonPoints(m.polygon);
+
+    if (orderedPoly.size() < 4) {
         Serial.println("❌ ERROR: se requieren 4 vértices para lawnmower.");
         return;
     }
@@ -1266,13 +1269,10 @@ void generateMissionPath(Mission& m) {
     // ---------------------------------------
     // CONFIGURACIÓN DEL ALGORITMO
     // ---------------------------------------
-    double TURN_RADIUS = 3.0;     // metros para suavizar curvas
-    double MIN_WP_DIST = 1.5;     // distancia mínima entre waypoints
+    double TURN_RADIUS = 2.0;
+    double MIN_WP_DIST = 1.5;
     double ds = (m.detect_spacing < 1.0) ? 1.0 : m.detect_spacing;
 
-    // ---------------------------------------
-    // Funciones auxiliares ENU<->Coordinate
-    // ---------------------------------------
     const double R = 6378137.0;
     double lat0 = deg2rad(m.home.lat);
     double lon0 = deg2rad(m.home.lon);
@@ -1292,11 +1292,9 @@ void generateMissionPath(Mission& m) {
         return c;
     };
 
-    // ---------------------------------------
-    // 1) Polígono local
-    // ---------------------------------------
+    // 1) Polígono local USANDO orderedPoly
     vector<std::pair<double,double>> poly;
-    for (auto &p : m.polygon)
+    for (auto &p : orderedPoly)
         poly.push_back(toLocal(p.lat, p.lon));
 
     int N = poly.size();
