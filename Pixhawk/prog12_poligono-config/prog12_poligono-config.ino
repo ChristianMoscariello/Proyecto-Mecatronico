@@ -811,10 +811,10 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       mission.detect_spacing = d["ds"] | 5.0;   // NUEVO CAMPO
       mission.loaded       = true;
 
+      currentWaypoint = 0;
+
       generateMissionPath(mission);
       sendAckToGS(msgId);
-      if (!pathPoints.empty())
-        sendActiveWaypointToGS(0, pathPoints[0]);
 
       // TAKEOFF real o simulado
       Serial.println("🚁 TAKEOFF NATIVO → GUIDED");
@@ -1476,13 +1476,28 @@ void generateMissionPath(Mission& m) {
     }
 
     // ---------------------------------------
-    // 10) Insertar HOME al inicio
+    // 10) Elegir el punto más cercano a HOME
     // ---------------------------------------
-    pathPoints.clear();
-    pathPoints.push_back(m.home);
+    int bestIdx = 0;
+    double bestDist = 1e30;
 
-    for (auto &p : filtered)
-        pathPoints.push_back(p);
+    for (int i = 0; i < filtered.size(); i++) {
+        double d = haversineDistance(
+            m.home.lat, m.home.lon,
+            filtered[i].lat, filtered[i].lon
+        );
+        if (d < bestDist) {
+            bestDist = d;
+            bestIdx = i;
+        }
+    }
+
+    // Rotamos la lista para empezar desde ahí
+    pathPoints.clear();
+    for (int i = 0; i < filtered.size(); i++) {
+        int idx = (bestIdx + i) % filtered.size();
+        pathPoints.push_back(filtered[idx]);
+    }
 
     // ---------------------------------------
     // 11) Enviar información a GS
@@ -1751,6 +1766,7 @@ void updateStateMachine() {
         if (testMode) {
             if (millis() - stateEntryTime > 1000) {
                 Serial.println("🛫 [TEST] TAKEOFF → NAVIGATE");
+                sendActiveWaypointToGS(0, pathPoints[0]);
                 state = NAVIGATE;
                 sendStatusToGS(state);
             }
@@ -1785,6 +1801,20 @@ void updateStateMachine() {
             break;
         }
 
+        // Ignorar WP0 si el dron está a menos de 10 m de HOME
+        if (currentWaypoint == 0) {
+            double hd = haversineDistance(
+                mav_lat, mav_lon,
+                mission.home.lat, mission.home.lon
+            );
+            if (hd < 12) {
+                Serial.println("⏭ Saltando WP0 (HOME demasiado cerca)");
+                currentWaypoint++;
+                sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
+                break;
+            }
+        }
+
         // Cálculo de distancia
         Coordinate target = pathPoints[currentWaypoint];
         double dist = haversineDistance(mav_lat, mav_lon, target.lat, target.lon);
@@ -1804,9 +1834,12 @@ void updateStateMachine() {
             //Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             lastNavDebug = millis();
         }
+        // Activar análisis solo después de WP0
+        bool allowAnalysis = (currentWaypoint > 0);
+
 
         // Detección estable
-        if (close_enough && stable_speed) {
+        if (close_enough && stable_speed && allowAnalysis) {
             unsigned long timeInside = millis() - insideRadiusSince;
             
             if (timeInside > 1500) {
