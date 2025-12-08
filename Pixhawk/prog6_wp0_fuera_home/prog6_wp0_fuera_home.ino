@@ -243,6 +243,9 @@ unsigned long analysisStartTime = 0;
 bool loraReturnCommand = false;
 bool loraDisarmCommand = false;
 
+// ⭐ MODO TEST (vuelo simulado sin mover motores)
+bool testMode = false;
+
 // Modo simulación
 bool simulationMode = false;
 
@@ -520,6 +523,7 @@ void sendEventToGS(const String &topic, double lat, double lon, double alt,
   Serial.print(" ID=");        Serial.println(msgID);
 }
 
+
 // ============================================================================
 // 🔎 Extracción de frames LoRa (GS#...#END)
 // ============================================================================
@@ -572,7 +576,9 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
   // ------------------------------------------------------------------
   if (fromGS) {
 
+    // -------------------------------
     // ACK desde GS
+    // -------------------------------
     if (strcmp(type, "ACK") == 0) {
       String id = "";
       if (doc.containsKey("d")) id = doc["d"]["id"] | "";
@@ -580,59 +586,94 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       return;
     }
 
-    // ARM → GUIDED + ARM
+    // ==========================================================
+    //  ⭐ SIM_ON → activar testMode + simulación
+    // ==========================================================
+    if (strcmp(type, "SIM_ON") == 0) {
+      simulationMode = true;
+      testMode      = true;   // << activar modo test
+      mav_armed     = true;   // << finge que está armado
+      Serial.println("🧪 MODO TEST + SIMULACIÓN ACTIVADOS");
+      sendAckToGS(msgId);
+      return;
+    }
+
+    // ==========================================================
+    //  ⭐ SIM_OFF → desactivar testMode + simulación
+    // ==========================================================
+    if (strcmp(type, "SIM_OFF") == 0) {
+      simulationMode = false;
+      testMode      = false;
+      Serial.println("🛑 MODO TEST DESACTIVADO");
+      sendAckToGS(msgId);
+      return;
+    }
+
+    // ==========================================================
+    //  ARM → en testMode se simula el ARM
+    // ==========================================================
     if (strcmp(type, "ARM") == 0) {
-      
+
       Serial.println("📡 GS → ARM solicitado");
 
-      // 1) Pedimos GUIDED antes del ARM
-      setModeGuided();
-      delay(150);
+      // 1) Siempre GUIDED antes de armar (solo en modo real)
+      if (!testMode) {
+        setModeGuided();
+        delay(150);
+      }
 
-      // 2) Enviamos ARM
-      pixhawkArm(true);
+      // -------------------------
+      // ⭐ MODO TEST → NO ARMAR REAL
+      // -------------------------
+      if (testMode) {
+        Serial.println("🛑 [TEST] ARM ignorado. Simulando armado.");
+        mav_armed = true;     // SIMULA ARM REAL
+      } else {
+        pixhawkArm(true);     // ARM REAL
+      }
 
-      // 3) Entramos al estado ARMING (FSM va a verificar)
+      // Estado ARMING
       state = ARMING;
       stateEntryTime = millis();
       sendStatusToGS(state);
 
-      // 4) Intento de confirmación rápida (2 s)
+      // Fast confirm
       armingConfirmationDeadline = millis() + 2000;
-      awaitingFastArmConfirm = true;
+      awaitingFastArmConfirm     = true;
 
-      // 5) Si ARMÓ rápido → pasamos directamente a READY_FOR_MISSION
+      // Confirmación instantánea
       if (mav_armed) {
-          Serial.println("✔ ARM confirmado por MAVLink (confirmación rápida)");
-          state = READY_FOR_MISSION;
-          sendStatusToGS(state);
+        Serial.println("✔ ARM confirmado (real o simulado)");
+        state = READY_FOR_MISSION;
+        sendStatusToGS(state);
       }
 
       return;
-     }
-
-    // DISARM (bandera, se atiende en la FSM)
-    if (strcmp(type, "DISARM") == 0) {
-        Serial.println("🛑 GS → DISARM");
-
-        // 1) Intento inmediato de desarmado real
-        pixhawkDisarmForce();
-
-        // 2) Marcamos bandera para la FSM
-        loraDisarmCommand = true;
-        delay(50);
-        pixhawkDisarmForce();
-        // 3) Avisamos a la estación
-        sendAckToGS(msgId);
-
-        // 4) Actualizamos estado
-        state = IDLE;
-        sendStatusToGS(state);
-
-        return;
     }
 
-    // RETURN (bandera)
+    // ==========================================================
+    // DISARM
+    // ==========================================================
+    if (strcmp(type, "DISARM") == 0) {
+      Serial.println("🛑 GS → DISARM");
+
+      if (!testMode) {
+        pixhawkDisarmForce();
+        delay(50);
+        pixhawkDisarmForce();
+      }
+
+      loraDisarmCommand = true;
+      sendAckToGS(msgId);
+
+      state = IDLE;
+      sendStatusToGS(state);
+      return;
+    }
+
+    // ==========================================================
+    // RETURN
+    // ==========================================================
     if (strcmp(type, "RETURN") == 0) {
       Serial.println("↩️ RETURN recibido");
       loraReturnCommand = true;
@@ -640,24 +681,9 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       return;
     }
 
-    // SIM_ON / SIM_OFF
-    if (strcmp(type, "SIM_ON") == 0) {
-      simulationMode = true;
-      Serial.println("🧪 SIMULACIÓN ACTIVADA");
-      sendAckToGS(msgId);
-      return;
-    }
-
-    if (strcmp(type, "SIM_OFF") == 0) {
-      simulationMode = false;
-      Serial.println("🛑 SIMULACIÓN DESACTIVADA");
-      sendAckToGS(msgId);
-      return;
-    }
-
-    // --------------------------------------------------------------
+    // ==========================================================
     // MISSION_COMPACT → ruta + takeoff nativo → FSM: TAKEOFF
-    // --------------------------------------------------------------
+    // ==========================================================
     if (strcmp(type, "MISSION_COMPACT") == 0) {
       Serial.println("📦 RX MISSION_COMPACT");
 
@@ -691,26 +717,29 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       mission.altitude     = d["a"] | 20.0;
       mission.spacing      = d["s"] | 10.0;
       mission.event_action = d["event_action"] | "NONE";
-
-      mission.loaded = true;
+      mission.loaded       = true;
 
       generateMissionPath(mission);
       sendAckToGS(msgId);
-      if (!pathPoints.empty()) {
-          sendActiveWaypointToGS(0, pathPoints[0]);
-      }
+      if (!pathPoints.empty())
+        sendActiveWaypointToGS(0, pathPoints[0]);
 
-
+      // TAKEOFF real o simulado
       Serial.println("🚁 TAKEOFF NATIVO → GUIDED");
-      setModeGuided();
-      delay(250);
-      pixhawkTakeoff(mission.altitude);
+      if (!testMode) setModeGuided();
+
+      if (testMode) {
+        Serial.println("🛫 [TEST] TAKEOFF simulado");
+      } else {
+        pixhawkTakeoff(mission.altitude);
+      }
 
       state = TAKEOFF;
       stateEntryTime = millis();
       return;
     }
-  }
+
+  } // <-- cierra if (fromGS)
 
   // ------------------------------------------------------------------
   // 2) MENSAJES DESDE LA RPi (EVENTOS)
@@ -747,35 +776,38 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
 
   Serial.printf("⚠️ Tipo desconocido: %s\n", type);
 }
-
 // ============================================================================
 // 📡 TELEMETRÍA PERIÓDICA HACIA GS
 // ============================================================================
 void handleTelemetry() {
-  static unsigned long lastTelemetryTime = 0;
+    static unsigned long lastTelemetryTime = 0;
 
-  if (millis() - lastTelemetryTime >= 1000) {
+    // Enviar telemetría cada 1 segundo
+    if (millis() - lastTelemetryTime >= 1000) {
 
-    if (!simulationMode && mav_has_fix) {
-      double lat      = mav_lat;
-      double lon      = mav_lon;
-      double alt      = mav_alt_rel;
-      double speed_km = mav_ground_speed * 3.6;
-      double heading  = mav_heading_deg;
-      unsigned long ts = millis();
+        if (!simulationMode && mav_has_fix) {
+            // Datos reales desde Pixhawk
+            double lat      = mav_lat;
+            double lon      = mav_lon;
+            double alt      = mav_alt_rel;
+            double speed_km = mav_ground_speed * 3.6;
+            double heading  = mav_heading_deg;
+            unsigned long ts = millis();
 
-      sendTelemetry(lat, lon, alt, speed_km, heading, ts);
+            sendTelemetry(lat, lon, alt, speed_km, heading, ts);
+        }
+        else if (simulationMode) {
+            // Modo simulación → usar valores filtrados
+            double lat = lat_f;
+            double lon = lon_f;
+            double alt = alt_f;
+            unsigned long ts = millis();
+
+            sendTelemetry(lat, lon, alt, 5.0, 0.0, ts);
+        }
+
+        lastTelemetryTime = millis();
     }
-    else if (simulationMode) {
-      double lat = lat_f;
-      double lon = lon_f;
-      double alt = alt_f;
-      unsigned long ts = millis();
-      sendTelemetry(lat, lon, alt, 5.0, 0.0, ts);
-    }
-
-    lastTelemetryTime = millis();
-  }
 }
 
 // ============================================================================
@@ -1389,6 +1421,19 @@ void updateStateMachine() {
 
 
     case TAKEOFF:
+
+        // 🧪 En TEST MODE no hay altitud real → pasamos a NAVIGATE por tiempo
+        if (testMode) {
+            if (millis() - stateEntryTime > 1000) {   // 1 segundo en TAKEOFF
+                Serial.println("🛫 [TEST] TAKEOFF simulado → NAVIGATE");
+                state = NAVIGATE;
+                stateEntryTime = millis();
+                sendStatusToGS(state);
+            }
+            break;
+        }
+
+        // 🚁 MODO REAL: esperamos alcanzar el 90% de la altitud
         if (mav_alt_rel >= mission.altitude * 0.90) {
             Serial.println("🛫 Altitud lograda → NAVIGATE");
             state = NAVIGATE;
@@ -1396,6 +1441,7 @@ void updateStateMachine() {
             sendStatusToGS(state);
         }
         break;
+
 
 
     case NAVIGATE: {
@@ -1435,8 +1481,8 @@ void updateStateMachine() {
         // Enviar GOTO continuamente mientras navega
         sendMavGoto(target.lat, target.lon, mission.altitude);
 
-        // Failsafe: si se desarma SOLO aquí te protege del fly-away
-        if (!mav_armed) {
+        // Failsafe: en MODO REAL sí chequeamos desarmado
+        if (!testMode && !mav_armed) {
             Serial.println("⚠ Se desarmó en vuelo → ABORT");
             state = IDLE;
             sendStatusToGS(state);

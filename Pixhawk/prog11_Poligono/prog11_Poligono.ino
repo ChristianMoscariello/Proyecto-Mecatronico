@@ -776,7 +776,7 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
         }
 
         // ------------------------------------------------------
-        // MISSION_COMPACT  (versión corregida)
+        // MISSION_COMPACT
         // ------------------------------------------------------
         if (strcmp(type, "MISSION_COMPACT") == 0) {
 
@@ -832,8 +832,12 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
                 40  // límite
             );
 
-            // Enviar todos los WPs
-            sendWaypointsBulkToGS(pathPoints);
+            // Enviar los WP uno por uno (como antes)
+            for (int i = 0; i < pathPoints.size(); i++) {
+                sendActiveWaypointToGS(i, pathPoints[i]);
+                delay(50);  // evita saturar LoRa
+            }
+
 
             // ACK
             sendAckToGS(msgId);
@@ -843,8 +847,22 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
                 sendActiveWaypointToGS(0, pathPoints[0]);
 
             // --------------------------------------------------
-            // Takeoff nativo
+            // Espera 60s para visualizar WPs
             // --------------------------------------------------
+            Serial.println("⏳ Esperando 60 segundos para visualizar WPs en la GS...");
+
+            unsigned long waitStart = millis();
+            while (millis() - waitStart < 60000UL) {   // 60 segundos
+
+                // reenviamos STATUS cada 3s para que la GS sepa que estamos vivos
+                if ((millis() - waitStart) % 3000 < 50) {
+                    sendStatusToGS(READY_FOR_MISSION);
+                }
+
+                delay(30);
+            }
+
+            // TAKEOFF REAL
             Serial.println("🚁 TAKEOFF NATIVO → GUIDED");
 
             if (!testMode)
@@ -862,10 +880,14 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
 
             return;
         }
-    }
+
+        // Si llegó acá es porque era un tipo de mensaje GS no reconocido
+        Serial.printf("⚠️ Tipo GS desconocido: %s\n", type);
+        return;
+    }  // ← cierra if (fromGS)
 
     // ==========================================================
-    // 2) MENSAJES DESDE LA RASPBERRY PI
+    // 2) MENSAJES DESDE LA RASPBERRY PI (fromGS == false)
     // ==========================================================
     if (strcmp(type, "GO") == 0) {
         analysisResult = GO;
@@ -901,8 +923,9 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
         return;
     }
 
-    Serial.printf("⚠️ Tipo desconocido: %s\n", type);
+    Serial.printf("⚠️ Tipo desconocido (RPi): %s\n", type);
 }
+
 
 // ============================================================================
 // 📡 TELEMETRÍA PERIÓDICA HACIA GS
@@ -1404,30 +1427,6 @@ void sendActiveWaypointToGS(int wp, const Coordinate& pt) {
     Serial.printf("📤 [GS] WP_UPDATE → wp=%d (%.6f, %.6f)\n", wp, pt.lat, pt.lon);
 }
 
-// ===============================================================
-// Enviar todos los WP a la GS en un solo paquete
-// ===============================================================
-void sendWaypointsBulkToGS(const vector<Coordinate> &wps) {
-    StaticJsonDocument<2048> doc;
-    doc["t"] = "WAYPOINTS_BULK";
-    doc["count"] = wps.size();
-
-    JsonArray arr = doc.createNestedArray("wps");
-
-    for (auto &p : wps) {
-        JsonObject o = arr.createNestedObject();
-        o["lat"] = p.lat;
-        o["lon"] = p.lon;
-    }
-
-    String payload;
-    serializeJson(doc, payload);
-
-    String frame = String(UAV_HDR) + payload + SFX;
-    sendWithAck(frame, generateMsgID());
-
-    Serial.printf("📤 WAYPOINTS_BULK enviado (%d WP)\n", wps.size());
-}
 
 void notifyWaypointReached(int wp) {
   StaticJsonDocument<128> doc;
