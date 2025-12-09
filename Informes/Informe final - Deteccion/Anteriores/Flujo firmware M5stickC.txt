@@ -1,0 +1,20 @@
+flowchart TD
+
+    A["Inicio del sistema"] --> B["Inicializar pantalla,<br/>serial, bus I2C<br/>y sensor MLX90640"]
+    B -->|Sensor OK| D["Configurar modo, resolución<br/>y frecuencia de actualización"]
+    B -->|Error| Z["Mostrar error en pantalla<br/>y detener ejecución"]
+
+    D --> F["Esperar comando por Serial"]
+
+    F -->|Comando = GET_FRAME| G["Iniciar captura térmica"]
+
+    G --> I{"Lectura MLX90640<br/>correcta?"}
+
+    I -->|No| J["Mostrar 'ERROR LECTURA'<br/>Volver al estado de espera"]
+    J --> F
+
+    I -->|Sí| K["Procesar matriz 32×24<br/>(redondeo a 2 decimales)"]
+    K --> L["Generar documento JSON<br/>con arreglo de 768 valores"]
+    L --> M["Limpiar buffer serial"]
+    M --> O["Enviar JSON serializado<br/>Retomar estado de espera"]
+    O --> F
