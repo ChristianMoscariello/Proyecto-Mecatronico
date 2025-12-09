@@ -177,6 +177,7 @@ bool statusDirty         = true;
 
 void resetMissionState();
 void sendStatusToGS(DroneState st);
+void simulateDroneMotion();
 
 // ============================================================================
 // 📡 Enviar estado de la FSM a la Ground Station
@@ -207,6 +208,7 @@ void sendStatusToGS(DroneState st) {
   lastSentState = st;
   statusDirty   = false;
 
+  // ----- Construimos JSON -----
   StaticJsonDocument<128> doc;
   doc["t"]       = "STATUS";
   doc["message"] = fsmStateToString((int)st);
@@ -215,13 +217,18 @@ void sendStatusToGS(DroneState st) {
   String payload;
   serializeJson(doc, payload);
 
-  String frame = String(UAV_HDR) + payload + SFX;
-  LoRa.beginPacket();
-  LoRa.print(frame);
-  LoRa.endPacket();
+  // ----- Generamos un msgID único -----
+  String msgID = generateMsgID();   // ← ya existe en tu sistema
 
-  Serial.println("📤 STATUS enviado: " + fsmStateToString((int)st));
+  // ----- Construimos el frame completo -----
+  String frame = String(UAV_HDR) + payload + SFX;   // ej: "UAV#{json}#END"
+
+  // ----- Envio usando ACK -----
+  sendWithAck(frame, msgID);
+
+  Serial.println("📤 STATUS enviado (ACK): " + fsmStateToString((int)st));
 }
+
 
 // Análisis RPi
 enum AnalysisResult { NONE, GO, FIRE, PERSON };
@@ -420,9 +427,9 @@ void handleAck(const String &ackID) {
         if (posEnd > posT) tipo = pendingMsgs[i].payload.substring(posT + 5, posEnd);
       }
 
-      Serial.print("✅ [ACK] ID="); Serial.print(ackID);
-      Serial.print(" (Tipo=");      Serial.print(tipo);
-      Serial.println(")");
+      //Serial.print("✅ [ACK] ID="); Serial.print(ackID);
+     // Serial.print(" (Tipo=");      Serial.print(tipo);
+      //Serial.println(")");
 
       pendingMsgs[i].waitingAck = false;
       pendingMsgs[i].payload = "";
@@ -430,7 +437,7 @@ void handleAck(const String &ackID) {
       return;
     }
   }
-  Serial.print("⚠️ [ACK desconocido] ID="); Serial.println(ackID);
+ // Serial.print("⚠️ [ACK desconocido] ID="); Serial.println(ackID);
 }
 
 void checkPendingAcks() {
@@ -454,15 +461,15 @@ void checkPendingAcks() {
           if (posEnd > posT) tipo = pendingMsgs[i].payload.substring(posT + 5, posEnd);
         }
 
-        Serial.print("🔁 [Reintento ACK] ID=");
-        Serial.print(pendingMsgs[i].msgID);
-        Serial.print(" Tipo="); Serial.print(tipo);
-        Serial.print(" quedan "); Serial.print(pendingMsgs[i].retries);
-        Serial.println(" intentos");
+       // Serial.print("🔁 [Reintento ACK] ID=");
+       // Serial.print(pendingMsgs[i].msgID);
+        //Serial.print(" Tipo="); Serial.print(tipo);
+       // Serial.print(" quedan "); Serial.print(pendingMsgs[i].retries);
+       // Serial.println(" intentos");
       } else {
-        Serial.print("❌ [ACK perdido] ID=");
-        Serial.print(pendingMsgs[i].msgID);
-        Serial.print(" payload="); Serial.println(pendingMsgs[i].payload);
+       // Serial.print("❌ [ACK perdido] ID=");
+       // Serial.print(pendingMsgs[i].msgID);
+       // Serial.print(" payload="); Serial.println(pendingMsgs[i].payload);
 
         pendingMsgs[i].waitingAck = false;
         pendingMsgs[i].payload = "";
@@ -492,7 +499,7 @@ void sendAckToGS(const String &id) {
   LoRa.print(msg);
   LoRa.endPacket();
 
-  Serial.println("📤 [sendAckToGS] " + msg);
+  //Serial.println("📤 [sendAckToGS] " + msg);
 }
 
 void sendJsonNoAckToGS(const JsonDocument &doc) {
@@ -537,27 +544,32 @@ void sendTelemetry(double lat,double lon,double alt,double speed,double heading,
 }
 
 
-void sendEventToGS(const String &topic, double lat, double lon, double alt,
-                   unsigned long ts, float confidence) {
+void sendEventToGS(const String &type, double lat, double lon, double alt, 
+                   unsigned long wpIndex, float temperature) 
+{
+  // ----- Construimos JSON -----
   StaticJsonDocument<256> doc;
-  doc["t"] = topic;
-
-  JsonObject d = doc.createNestedObject("d");
-  d["lat"]        = lat;
-  d["lon"]        = lon;
-  d["alt"]        = alt;
-  d["confidence"] = confidence;
-
-  String msgID = generateMsgID();
-  doc["id"] = msgID;
-  doc["ts"] = ts;
+  doc["t"]       = type;      // Ej: "EVENT_FIRE", "EVENT_PERSON", etc.
+  doc["lat"]     = lat;
+  doc["lon"]     = lon;
+  doc["alt"]     = alt;
+  doc["wp"]      = wpIndex;
+  doc["temp"]    = temperature;
+  doc["ts"]      = millis();
 
   String payload;
   serializeJson(doc, payload);
-  sendWithAck(payload, msgID);
 
-  Serial.print("📤 [EVENT] "); Serial.print(topic);
-  Serial.print(" ID=");        Serial.println(msgID);
+  // ----- Generamos msgID único -----
+  String msgID = generateMsgID();
+
+  // ----- Armamos frame UAV#...#END -----
+  String frame = String(UAV_HDR) + payload + SFX;
+
+  // ----- Envío por ACK -----
+  sendWithAck(frame, msgID);
+
+  Serial.println("📤 EVENT enviado (ACK): " + type);
 }
 
 
@@ -957,7 +969,7 @@ void sendStableToRPi(const Coordinate &pos) {
   serializeJson(doc, payload);
   SerialRPI.println(payload);
 
-  Serial.println("📤 [RPi] " + payload);
+  //Serial.println("📤 [RPi] " + payload);
 }
 
 // ============================================================================
@@ -1137,8 +1149,8 @@ void readMavlink() {
     if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
 
       // DEBUG (desactivable)
-      Serial.print("MSG ID: ");
-      Serial.println(msg.msgid);
+      //Serial.print("MSG ID: ");
+      //Serial.println(msg.msgid);
 
       switch (msg.msgid) {
 
@@ -1158,8 +1170,8 @@ void readMavlink() {
           mav_armed = (mav_base_mode & MAV_MODE_FLAG_SAFETY_ARMED);
 
           // debug
-          Serial.print("ARMED = ");
-          Serial.println(mav_armed);
+          //Serial.print("ARMED = ");
+          //Serial.println(mav_armed);
           mav_last_update_ms = millis();
           break;
         }
@@ -1196,8 +1208,8 @@ void readMavlink() {
           memcpy(buf, st.text, 50);
           buf[50] = 0;
 
-          Serial.print("[STATUSTEXT] ");
-          Serial.println(buf);
+          //Serial.print("[STATUSTEXT] ");
+          //Serial.println(buf);
           break;
         }
 
@@ -1228,7 +1240,7 @@ void readMavlink() {
           mav_batt_remaining = sys.battery_remaining;        // %
 
           // debug
-          Serial.print("Batt: "); Serial.println(mav_batt_voltage);
+         // Serial.print("Batt: "); Serial.println(mav_batt_voltage);
 
           break;
         }
@@ -1527,8 +1539,8 @@ void navigateTo(const Coordinate& target) {
   double dist    = haversineDistance(mav_lat, mav_lon, target.lat, target.lon);
   double bearing = computeBearing(mav_lat, mav_lon, target.lat, target.lon);
 
-  Serial.printf("🧭 NAV → bearing=%.1f°, dist=%.1f m → (%.6f, %.6f)\n",
-                bearing, dist, target.lat, target.lon);
+  //Serial.printf("🧭 NAV → bearing=%.1f°, dist=%.1f m → (%.6f, %.6f)\n",
+                //bearing, dist, target.lat, target.lon);
 
       if (millis() - lastGotoMs > 500) {
         sendMavGoto(target.lat, target.lon, mission.altitude);
@@ -1574,7 +1586,7 @@ void notifyWaypointReached(int wp) {
   LoRa.print(frame);
   LoRa.endPacket();
 
-  Serial.printf("📤 [GS] WAYPOINT_REACHED wp=%d\n", wp);
+  //Serial.printf("📤 [GS] WAYPOINT_REACHED wp=%d\n", wp);
 }
 
 void triggerServoAction() {
@@ -1599,8 +1611,7 @@ void handleServoAction() {
 // ============================================================================
 void updateStateMachine() {
 
-  
-    static DroneState lastState = IDLE;   // ⬅⬅⬅ AGREGAR ESTO
+    static DroneState lastState = IDLE;
 
     bool inFlight =
         (state == TAKEOFF) ||
@@ -1611,61 +1622,109 @@ void updateStateMachine() {
 
     static unsigned long lastFailsafeLog = 0;
 
-    // ---------------------------------------------------------
-    // PRIORIDAD 1: comandos de la GS (DISARM / RETURN)
-    // ---------------------------------------------------------
-    if (loraDisarmCommand) {
-        loraDisarmCommand = false;
-        pixhawkArm(false);       // desarma por seguridad
-        resetMissionState();     // resetea misión y vuelve a IDLE
-        sendStatusToGS(state);
-        return;                  // nada más que hacer en este ciclo
+    // =========================================================================
+    // 🐛 DEBUG: Monitoreo de comandos entrantes
+    // =========================================================================
+    static unsigned long lastCmdCheck = 0;
+    if (millis() - lastCmdCheck > 3000) {
+        Serial.println("╔═══════════════════════════════════════╗");
+        Serial.printf("║ Estado: %-30s║\n", fsmStateToString(state).c_str());
+        Serial.printf("║ Armed: %-31s║\n", mav_armed ? "TRUE" : "FALSE");
+        Serial.printf("║ GPS Fix: %-29s║\n", mav_has_fix ? "TRUE" : "FALSE");
+        Serial.printf("║ Test Mode: %-27s║\n", testMode ? "TRUE" : "FALSE");
+        Serial.printf("║ loraReturnCmd: %-23s║\n", loraReturnCommand ? "PENDING" : "false");
+        Serial.printf("║ loraDisarmCmd: %-23s║\n", loraDisarmCommand ? "PENDING" : "false");
+        Serial.println("╚═══════════════════════════════════════╝");
+        lastCmdCheck = millis();
     }
 
-    if (loraReturnCommand) {
+    // =========================================================================
+    // ✅ FIX 1: PRIORIDAD MÁXIMA - Comandos críticos ANTES del switch
+    // =========================================================================
+    
+    // DISARM tiene prioridad absoluta
+    if (loraDisarmCommand) {
+        Serial.println("🛑 ════════════════════════════════════");
+        Serial.println("   DISARM GLOBAL RECIBIDO");
+        Serial.println("   Desarmando y reseteando...");
+        Serial.println("════════════════════════════════════");
+        loraDisarmCommand = false;
+        if (!testMode) pixhawkArm(false);
+        resetMissionState();
+        return;
+    }
+
+    // RETURN tiene segunda prioridad (solo si está en vuelo)
+    if (loraReturnCommand && inFlight) {
+        Serial.println("↩️ ════════════════════════════════════");
+        Serial.println("   RETURN HOME RECIBIDO");
+        Serial.printf("   Desde estado: %s\n", fsmStateToString(state).c_str());
+        Serial.println("════════════════════════════════════");
         loraReturnCommand = false;
         state = RETURN_HOME;
         sendStatusToGS(state);
+        // NO hacemos return aquí para que siga ejecutando RETURN_HOME
     }
 
-    // ---------------------------------------------------------
-    // PRIORIDAD 2: FAILSAFE por pérdida de MAVLink
-    // ---------------------------------------------------------
-   if (!testMode && inFlight && (millis() - mav_last_update_ms > 3000)) {
-
-
-        if (state != RETURN_HOME) {   // evitar spam
+    // =========================================================================
+    // FAILSAFE por pérdida de MAVLink
+    // =========================================================================
+    if (!testMode && inFlight && (millis() - mav_last_update_ms > 3000)) {
+        if (state != RETURN_HOME) {
             state = RETURN_HOME;
             sendStatusToGS(state);
         }
-
         if (millis() - lastFailsafeLog > 5000) {
             Serial.println("❌ FAILSAFE: MAVLink perdido → RETURN_HOME");
             lastFailsafeLog = millis();
         }
     }
 
+    // =========================================================================
+    // ✅ FIX 2: RESET de timers al cambiar de estado (ANTES del switch)
+    // =========================================================================
+    if (state != lastState) {
+        Serial.printf("🔄 Cambio de estado: %s → %s\n", 
+                     fsmStateToString(lastState).c_str(), 
+                     fsmStateToString(state).c_str());
+        
+        // Resetear timers críticos
+        stateEntryTime = millis();
+        insideRadiusSince = millis();
+        
+        // Si entramos a WAIT_ANALYSIS, inicializar su timer
+        if (state == WAIT_ANALYSIS) {
+            analysisStartTime = millis();
+            Serial.printf("⏱️ analysisStartTime = %lu\n", analysisStartTime);
+        }
+        
+        lastState = state;
+    }
+
+    // =========================================================================
+    // MAIN SWITCH
+    // =========================================================================
     switch (state) {
 
-
+    // -------------------------------------------------------------------------
     case IDLE:
-      // Solo enviar una vez si entra acá
-      sendStatusToGS(state);
-      break;
+        sendStatusToGS(state);
+        break;
 
+    // -------------------------------------------------------------------------
     case ARMING: {
-
-            // Fast confirm dentro del periodo
+        // Fast confirm
         if (awaitingFastArmConfirm && millis() < armingConfirmationDeadline) {
             if (mav_armed) {
-                Serial.println("✔ ARM confirmado (fast confirm)");
+                Serial.println("✔ ARM confirmado (fast)");
                 awaitingFastArmConfirm = false;
                 state = READY_FOR_MISSION;
                 sendStatusToGS(state);
                 break;
             }
         }
-        // 2) Si ARMÓ → seguimos
+
+        // Armó correctamente
         if (mav_armed) {
             Serial.println("✔ ARMADO OK");
             state = READY_FOR_MISSION;
@@ -1673,85 +1732,68 @@ void updateStateMachine() {
             break;
         }
 
-        // 3) Si pasan más de 8 segundos → error de armado
+        // Timeout de armado
         if (millis() - stateEntryTime > 8000) {
             Serial.println("❌ ERROR: Pixhawk NO ARMÓ");
-
-            // Forzamos desarmado por seguridad
-            pixhawkArm(false);
-
-            // Volvemos al estado inicial
+            if (!testMode) pixhawkArm(false);
             state = IDLE;
             sendStatusToGS(state);
             break;
         }
 
-        // Aún en ARMING → informar estado una sola vez
-        sendStatusToGS(state);
         break;
     }
 
-
+    // -------------------------------------------------------------------------
     case READY_FOR_MISSION:
-    if (!mav_has_fix || mav_alt_rel == 0 || mav_lat == 0) {
-    Serial.println("❌ No GPS FIX, esperando...");
-    return;
-    }
-       break;
+        if (!testMode && (!mav_has_fix || mav_alt_rel == 0 || mav_lat == 0)) {
+            Serial.println("❌ No GPS FIX, esperando...");
+            return;
+        }
+        break;
 
+    // -------------------------------------------------------------------------
     case PREPARE_TAKEOFF:
-      Serial.println("🛫 PREP → TAKEOFF");
+        Serial.println("🛫 PREP → TAKEOFF");
+        if (!testMode) pixhawkTakeoff(mission.altitude);
+        state = TAKEOFF;
+        sendStatusToGS(state);
+        break;
 
-      pixhawkTakeoff(mission.altitude);
-      state = TAKEOFF;
-      stateEntryTime = millis();
-      sendStatusToGS(state);
-      break;
-
-
+    // -------------------------------------------------------------------------
     case TAKEOFF:
-
-        // 🧪 En TEST MODE no hay altitud real → pasamos a NAVIGATE por tiempo
+        // Test mode
         if (testMode) {
-<<<<<<< HEAD:Pixhawk/prog9_versionchris/prog9_versionchris.ino
-<<<<<<< Updated upstream:Pixhawk/prog9_versionchris/prog9_versionchris.ino
-            if (millis() - stateEntryTime > 100) {   // 1 segundo en TAKEOFF
-=======
-            if (millis() - stateEntryTime > 1400) {   // 1 segundo en TAKEOFF
->>>>>>> Stashed changes:Pixhawk/prog7_testmode1/prog7_testmode1.ino
-                Serial.println("🛫 [TEST] TAKEOFF simulado → NAVIGATE");
-=======
             if (millis() - stateEntryTime > 1000) {
                 Serial.println("🛫 [TEST] TAKEOFF → NAVIGATE");
                 sendActiveWaypointToGS(0, pathPoints[0]);
->>>>>>> 68c366def15d322e61e6b720eae21affac61de70:Pixhawk/prog12_poligono-config/prog12_poligono-config.ino
                 state = NAVIGATE;
-                stateEntryTime = millis();
                 sendStatusToGS(state);
             }
             break;
         }
 
-        // 🚁 MODO REAL: esperamos alcanzar el 90% de la altitud
+        // Modo real
         if (mav_alt_rel >= mission.altitude * 0.90) {
             Serial.println("🛫 Altitud lograda → NAVIGATE");
             state = NAVIGATE;
-            stateEntryTime = millis();
             sendStatusToGS(state);
         }
         break;
 
-
-
+    // -------------------------------------------------------------------------
     case NAVIGATE: {
+        
+        // ✅ FIX 3: Comandos ya procesados arriba, pero confirmamos
+        if (loraReturnCommand) {
+            Serial.println("↩️ RETURN desde NAVIGATE");
+            loraReturnCommand = false;
+            state = RETURN_HOME;
+            sendStatusToGS(state);
+            break;
+        }
 
-<<<<<<< Updated upstream:Pixhawk/prog9_versionchris/prog9_versionchris.ino
-    // 🔄 RESET crítico al entrar a NAVIGATE
-    if (state != lastState) {
-        insideRadiusSince = millis();   // <--- RESET REAL
-        lastState = state;
-    }
-=======
+        // Fin de waypoints
         if (currentWaypoint >= (int)pathPoints.size()) {
             Serial.println("🏁 Fin ruta → RETURN_HOME");
             state = RETURN_HOME;
@@ -1759,8 +1801,6 @@ void updateStateMachine() {
             break;
         }
 
-<<<<<<< HEAD:Pixhawk/prog9_versionchris/prog9_versionchris.ino
-=======
         // Ignorar WP0 si el dron está a menos de 10 m de HOME
         if (currentWaypoint == 0) {
             double hd = haversineDistance(
@@ -1776,19 +1816,11 @@ void updateStateMachine() {
         }
 
         // Cálculo de distancia
->>>>>>> 68c366def15d322e61e6b720eae21affac61de70:Pixhawk/prog12_poligono-config/prog12_poligono-config.ino
         Coordinate target = pathPoints[currentWaypoint];
         double dist = haversineDistance(mav_lat, mav_lon, target.lat, target.lon);
+        bool close_enough = (dist < 7.0);
+        bool stable_speed = (mav_ground_speed < 2.0);
 
-<<<<<<< HEAD:Pixhawk/prog9_versionchris/prog9_versionchris.ino
-        bool close_enough = dist < 7.0;       // 3 m de radio WP
-        bool stable_speed = mav_ground_speed < 200.0;  // 2 m/s tolerante
-
-        if (close_enough && stable_speed) {
-            if (millis() - insideRadiusSince > 1500) {   // 2 sec dentro del radio
-
-                Serial.printf("✔ WP %d alcanzado\n", currentWaypoint);
-=======
         // 🐛 DEBUG: Info cada 2 segundos
         static unsigned long lastNavDebug = 0;
         if (millis() - lastNavDebug > 2000) {
@@ -1813,69 +1845,51 @@ void updateStateMachine() {
             if (timeInside > 1500) {
                 Serial.printf("✔ WP %d ALCANZADO (dist=%.1fm, time=%lums)\n", 
                              currentWaypoint, dist, timeInside);
->>>>>>> 68c366def15d322e61e6b720eae21affac61de70:Pixhawk/prog12_poligono-config/prog12_poligono-config.ino
                 notifyWaypointReached(currentWaypoint);
-
+                
                 state = STABILIZE;
-                stateEntryTime = millis();
                 analysisResult = NONE;
-
                 sendStableToRPi(target);
                 sendStatusToGS(state);
-                return;
+                break;
+            } else {
+                // 🐛 Muestra progreso cada 500ms
+                static unsigned long lastProgressPrint = 0;
+                if (millis() - lastProgressPrint > 500) {
+                   // Serial.printf("⏳ Dentro del radio: %lu/1500 ms\n", timeInside);
+                    lastProgressPrint = millis();
+                }
             }
-        } 
-        else {
+        } else {
+            // Se salió del radio
             insideRadiusSince = millis();
         }
 
-        // Enviar GOTO continuamente mientras navega
-        sendMavGoto(target.lat, target.lon, mission.altitude);
+        // Enviar GOTO
+        if (millis() - lastGotoMs > 500) {
+            sendMavGoto(target.lat, target.lon, mission.altitude);
+            lastGotoMs = millis();
+        }
 
-        // Failsafe: en MODO REAL sí chequeamos desarmado
+        // Failsafe desarmado
         if (!testMode && !mav_armed) {
-            Serial.println("⚠ Se desarmó en vuelo → ABORT");
+            Serial.println("⚠ Se desarmó en vuelo → IDLE");
             state = IDLE;
             sendStatusToGS(state);
-            break;
         }
->>>>>>> Stashed changes:Pixhawk/prog7_testmode1/prog7_testmode1.ino
 
-    // 1) ¿Se acabaron los waypoints?
-    if (currentWaypoint >= (int)pathPoints.size()) {
-        Serial.println("🏁 Fin ruta → RETURN_HOME");
-        state = RETURN_HOME;
-        sendStatusToGS(state);
         break;
     }
 
-<<<<<<< Updated upstream:Pixhawk/prog9_versionchris/prog9_versionchris.ino
-    // 2) Calculamos distancia al waypoint objetivo
-    Coordinate target = pathPoints[currentWaypoint];
-    double dist = haversineDistance(mav_lat, mav_lon, target.lat, target.lon);
-=======
+    // -------------------------------------------------------------------------
     case STABILIZE:
-      if (millis() - stateEntryTime > 700) {
-        Serial.println("📷 Estabilizado → WAIT_ANALYSIS");
-        state = WAIT_ANALYSIS;
-        analysisStartTime = millis();
-        sendStatusToGS(state);
-      }
-      break;
->>>>>>> Stashed changes:Pixhawk/prog7_testmode1/prog7_testmode1.ino
+        if (millis() - stateEntryTime > 800) {
+            Serial.println("📷 Estabilizado → WAIT_ANALYSIS");
+            state = WAIT_ANALYSIS;
+            sendStatusToGS(state);
+        }
+        break;
 
-<<<<<<< HEAD:Pixhawk/prog9_versionchris/prog9_versionchris.ino
-    bool close_enough = dist < 7.0;        // radio de tolerancia
-    bool stable_speed = mav_ground_speed < 200.0;
-
-    // 3) Detección estable de WP alcanzado
-    if (close_enough && stable_speed) {
-
-        if (millis() - insideRadiusSince > 1500) { // 1.5s dentro del radio
-
-            Serial.printf("✔ WP %d alcanzado\n", currentWaypoint);
-            notifyWaypointReached(currentWaypoint);
-=======
     // -------------------------------------------------------------------------
     case WAIT_ANALYSIS: {
 
@@ -1933,78 +1947,11 @@ void updateStateMachine() {
                 }
                 sendStatusToGS(state);
             }
->>>>>>> 68c366def15d322e61e6b720eae21affac61de70:Pixhawk/prog12_poligono-config/prog12_poligono-config.ino
 
-            state = STABILIZE;
-            stateEntryTime = millis();
             analysisResult = NONE;
-
-<<<<<<< HEAD:Pixhawk/prog9_versionchris/prog9_versionchris.ino
-            sendStableToRPi(target);
-            sendStatusToGS(state);
-            return;
+            break;
         }
-    }
-    else {
-        insideRadiusSince = millis();  // ← si se sale del radio, resetea
-    }
 
-    // 4) Enviar GOTO hacia el WP
-    sendMavGoto(target.lat, target.lon, mission.altitude);
-
-    // 5) FAILSAFE (solo real)
-    if (!testMode && !mav_armed) {
-        Serial.println("⚠ Se desarmó en vuelo → ABORT");
-        state = IDLE;
-        sendStatusToGS(state);
-        break;
-    }
-
-    break;
-}
-
-
-    case STABILIZE:
-    if (millis() - stateEntryTime > 800) {   // antes era 700
-        Serial.println("📷 Estabilizado → WAIT_ANALYSIS");
-        analysisStartTime = millis();
-        state = WAIT_ANALYSIS;
-        sendStatusToGS(state);
-    }
-    break;
-
-
-   case WAIT_ANALYSIS:
-
-    // PRIORIDAD 1 — RETURN
-    if (loraReturnCommand) {
-        Serial.println("↩️ RETURN durante análisis");
-        loraReturnCommand = false;
-        state = RETURN_HOME;
-        sendStatusToGS(state);
-        break;
-    }
-
-    // PRIORIDAD 2 — DISARM
-    if (loraDisarmCommand) {
-        Serial.println("🛑 DISARM durante análisis");
-        pixhawkArm(false);
-        resetMissionState();
-        sendStatusToGS(state);
-        break;
-    }
-
-    bool hasMore = (currentWaypoint + 1 < (int)pathPoints.size());
-
-    // RESULTADO DE RPi
-    if (analysisResult != NONE) {
-
-        if (analysisResult == GO) {
-            currentWaypoint++;
-            if (!hasMore) {
-                state = RETURN_HOME;
-            } else {
-=======
         // ============================================================
         // 3) EARLY AUTO-CONTINUE (para no frenar el dron innecesariamente)
         // ============================================================
@@ -2026,9 +1973,7 @@ void updateStateMachine() {
 
             if (!hasMore) state = RETURN_HOME;
             else {
->>>>>>> 68c366def15d322e61e6b720eae21affac61de70:Pixhawk/prog12_poligono-config/prog12_poligono-config.ino
                 state = NAVIGATE;
-                stateEntryTime = millis();
                 sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
             }
 
@@ -2036,65 +1981,48 @@ void updateStateMachine() {
             break;
         }
 
-<<<<<<< HEAD:Pixhawk/prog9_versionchris/prog9_versionchris.ino
-        else if (analysisResult == FIRE || analysisResult == PERSON) {
-
-            if (analysisResult == PERSON) triggerServoAction();
-
-            if (mission.event_action.equalsIgnoreCase("RETURN") || !hasMore) {
-                state = RETURN_HOME;
-            } else {
-                currentWaypoint++;
-                state = NAVIGATE;
-                stateEntryTime = millis();
-                sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
-            }
-            sendStatusToGS(state);
-        }
-
-        analysisResult = NONE;
-=======
         // ============================================================
         // 5) Si no hay nada que hacer → esperar
         // ============================================================
 
->>>>>>> 68c366def15d322e61e6b720eae21affac61de70:Pixhawk/prog12_poligono-config/prog12_poligono-config.ino
         break;
     }
 
-    // TIMEOUT
-    if (millis() - analysisStartTime > ANALYSIS_TIMEOUT) {
-        currentWaypoint++;
-        if (!hasMore) {
-            state = RETURN_HOME;
-        } else {
-            state = NAVIGATE;
-            stateEntryTime = millis();
-            sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
-        }
-        sendStatusToGS(state);
-    }
-
-    break;
-
-
-
+    // -------------------------------------------------------------------------
     case RETURN_HOME: {
-
+        
         double distHome = haversineDistance(
             mav_lat, mav_lon,
             mission.home.lat, mission.home.lon
         );
 
-        // GOTO continuo hacia HOME
-        sendMavGoto(mission.home.lat, mission.home.lon, mission.altitude);
+        // 🐛 DEBUG: Status cada 2s
+        static unsigned long lastReturnDebug = 0;
+        if (millis() - lastReturnDebug > 2000) {
+            //Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            //Serial.println("🏠 RETURN_HOME");
+            //Serial.printf("   HOME: %.6f, %.6f\n", mission.home.lat, mission.home.lon);
+            //Serial.printf("   Actual: %.6f, %.6f\n", mav_lat, mav_lon);
+            //Serial.printf("   Distancia: %.1f m\n", distHome);
+           // Serial.printf("   Speed: %.1f m/s\n", mav_ground_speed);
+            //Serial.printf("   Alt: %.1f m\n", mav_alt_rel);
+          //  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            lastReturnDebug = millis();
+        }
 
-        bool close_home = distHome < 3.5;      // tolerancia realista
-        bool slow_home  = mav_ground_speed < 2.0;
+        // GOTO continuo
+        if (millis() - lastGotoMs > 500) {
+            sendMavGoto(mission.home.lat, mission.home.lon, mission.altitude);
+            lastGotoMs = millis();
+        }
+
+        bool close_home = (distHome < 3.5);
+        bool slow_home  = (mav_ground_speed < 2.0);
 
         if (close_home && slow_home) {
-            Serial.println("🏠 HOME → LAND");
-            pixhawkLand();  
+            Serial.println("🏠 HOME alcanzado → LAND");
+            Serial.printf("   Final dist: %.1fm, speed: %.1fm/s\n", distHome, mav_ground_speed);
+            if (!testMode) pixhawkLand();
             state = LAND;
             sendStatusToGS(state);
         }
@@ -2102,10 +2030,8 @@ void updateStateMachine() {
         break;
     }
 
-
-
+    // -------------------------------------------------------------------------
     case LAND:
-        // Solo monitoreamos
         if (mav_alt_rel < 0.3 && mav_ground_speed < 0.2) {
             Serial.println("🟢 Aterrizaje completo");
             state = COMPLETE;
@@ -2113,144 +2039,13 @@ void updateStateMachine() {
         }
         break;
 
+    // -------------------------------------------------------------------------
     case COMPLETE:
-      Serial.println("🎉 COMPLETE → reset");
-      sendStatusToGS(state);
-      resetMissionState();
-      break;
-  }
-}
-void simulateDroneMotion() {
-  if (!simulationMode || !mission.loaded) return;
-
-  static unsigned long lastStepTime = 0;
-  if (millis() - lastStepTime < 600) return;
-  lastStepTime = millis();
-
-  switch (state) {
-
-    case IDLE:
-      sendStatusToGS(state);
-      break;
-
-    case TAKEOFF:
-      alt_f += 0.4;
-      if (alt_f >= mission.altitude) {
-        alt_f = mission.altitude;
-        Serial.println("🛫 [SIM] TAKEOFF → NAVIGATE");
-        state = NAVIGATE;
-        stateEntryTime = millis();
+        //Serial.println("🎉 COMPLETE → reset");
         sendStatusToGS(state);
-      }
-      break;
-
-    case NAVIGATE:
-      if (currentWaypoint >= (int)pathPoints.size()) {
-        Serial.println("🏁 [SIM] → RETURN_HOME");
-        state = RETURN_HOME;
-        sendStatusToGS(state);
+        resetMissionState();
         break;
-      }
-
-      {
-        Coordinate target = pathPoints[currentWaypoint];
-        double dist = haversineDistance(lat_f, lon_f, target.lat, target.lon);
-
-        lat_f += (target.lat - lat_f) * 0.25;
-        lon_f += (target.lon - lon_f) * 0.25;
-        alt_f  = mission.altitude;
-
-        if (dist < 1.5) {
-          Serial.printf("✔ [SIM] WP%d → STABILIZE\n", currentWaypoint);
-          notifyWaypointReached(currentWaypoint);
-          sendStableToRPi(target);
-          state = STABILIZE;
-          stateEntryTime = millis();
-          sendStatusToGS(state);
-        }
-      }
-      break;
-
-    case STABILIZE:
-      if (millis() - stateEntryTime > 700) {
-        state = WAIT_ANALYSIS;
-        sendStatusToGS(state);
-      }
-      break;
-
-    case WAIT_ANALYSIS:
-
-      if (loraReturnCommand) {
-        loraReturnCommand = false;
-        state = RETURN_HOME;
-        sendStatusToGS(state);
-        break;
-      }
-
-      if (analysisResult == GO) {
-        currentWaypoint++;
-        state = NAVIGATE;
-        sendStatusToGS(state);
-        analysisResult = NONE;
-        break;
-      }
-
-      if (analysisResult == FIRE) {
-        if (mission.event_action.equalsIgnoreCase("RETURN"))
-          state = RETURN_HOME;
-        else {
-          currentWaypoint++;
-          state = NAVIGATE;
-        }
-        sendStatusToGS(state);
-        analysisResult = NONE;
-        break;
-      }
-
-      if (analysisResult == PERSON) {
-        triggerServoAction();
-        if (mission.event_action.equalsIgnoreCase("RETURN"))
-          state = RETURN_HOME;
-        else {
-          currentWaypoint++;
-          state = NAVIGATE;
-        }
-        sendStatusToGS(state);
-        analysisResult = NONE;
-        break;
-      }
-
-      if (millis() - analysisStartTime > ANALYSIS_TIMEOUT) {
-        currentWaypoint++;
-        state = NAVIGATE;
-        sendStatusToGS(state);
-      }
-      break;
-
-    case RETURN_HOME:
-      lat_f += (mission.home.lat - lat_f) * 0.25;
-      lon_f += (mission.home.lon - lon_f) * 0.25;
-      alt_f  = max(alt_f - 0.05, 0.0);
-
-      if (haversineDistance(lat_f, lon_f, mission.home.lat, mission.home.lon) < 1.5) {
-        state = LAND;
-        sendStatusToGS(state);
-      }
-      break;
-
-    case LAND:
-      alt_f = max(alt_f - 0.15, 0.0);
-      if (alt_f <= 0.5) {
-        state = COMPLETE;
-        sendStatusToGS(state);
-      }
-      break;
-
-    case COMPLETE:
-      resetMissionState();
-      sendStatusToGS(state);
-      break;
-  }
+    }
 }
 
 void resetMissionState() {
@@ -2334,6 +2129,181 @@ void setup() {
   requestMavlinkStreams();
   delay(1500);
   Serial.println("🚀 Sistema iniciado");
+}
+void simulateDroneMotion() {
+    if (!simulationMode || !mission.loaded) return;
+
+    static unsigned long lastStepTime = 0;
+    if (millis() - lastStepTime < 600)
+        return;
+    lastStepTime = millis();
+
+    switch (state) {
+
+        case IDLE:
+            sendStatusToGS(state);
+            break;
+
+        case TAKEOFF:
+            alt_f += 0.4;
+            if (alt_f >= mission.altitude) {
+                alt_f = mission.altitude;
+                //Serial.println("🛫 [SIM] TAKEOFF → NAVIGATE");
+                state = NAVIGATE;
+                stateEntryTime = millis();
+                sendStatusToGS(state);
+            }
+            break;
+
+        case NAVIGATE: {
+            if (currentWaypoint >= (int)pathPoints.size()) {
+                //Serial.println("🏁 [SIM] → RETURN_HOME");
+                state = RETURN_HOME;
+                sendStatusToGS(state);
+                break;
+            }
+
+            Coordinate target = pathPoints[currentWaypoint];
+            double dist = haversineDistance(lat_f, lon_f, target.lat, target.lon);
+
+            lat_f += (target.lat - lat_f) * 0.25;
+            lon_f += (target.lon - lon_f) * 0.25;
+            alt_f  = mission.altitude;
+
+            if (dist < 1.5) {
+                //Serial.printf("✔ [SIM] WP%d → STABILIZE\n", currentWaypoint);
+                notifyWaypointReached(currentWaypoint);
+                sendStableToRPi(target);
+                state = STABILIZE;
+                stateEntryTime = millis();
+                sendStatusToGS(state);
+            }
+        } break;
+
+        case STABILIZE:
+            if (millis() - stateEntryTime > 700) {
+                state = WAIT_ANALYSIS;
+                sendStatusToGS(state);
+            }
+            break;
+
+        case WAIT_ANALYSIS: {
+
+    // PRIORIDAD 1 — RETURN
+    if (loraReturnCommand) {
+        //Serial.println("↩️ RETURN durante análisis");
+        loraReturnCommand = false;
+        state = RETURN_HOME;
+        sendStatusToGS(state);
+        break;
+    }
+
+    // PRIORIDAD 2 — DISARM
+    if (loraDisarmCommand) {
+        //Serial.println("🛑 DISARM durante análisis");
+        pixhawkArm(false);
+        resetMissionState();
+        sendStatusToGS(state);
+        break;
+    }
+
+    bool hasMore = (currentWaypoint + 1 < (int)pathPoints.size());
+
+    // -------------------------------
+    // RESULTADO RPi
+    // -------------------------------
+    if (analysisResult != NONE) {
+
+        if (analysisResult == GO) {
+            currentWaypoint++;
+            state = hasMore ? NAVIGATE : RETURN_HOME;
+            stateEntryTime = millis();
+            if (hasMore) sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
+            sendStatusToGS(state);
+        }
+
+        else if (analysisResult == FIRE || analysisResult == PERSON) {
+
+            if (analysisResult == PERSON) triggerServoAction();
+
+            if (!hasMore || mission.event_action.equalsIgnoreCase("RETURN")) {
+                state = RETURN_HOME;
+            } else {
+                currentWaypoint++;
+                state = NAVIGATE;
+                stateEntryTime = millis();
+                sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
+            }
+            sendStatusToGS(state);
+        }
+
+        analysisResult = NONE;
+        break;
+    }
+
+
+    // -------------------------------
+    // 🚀 FIX: SALIDA AUTOMÁTICA SIN RPi
+    // -------------------------------
+    if (millis() - analysisStartTime > 2000) {   // <<---- antes del timeout grande
+        Serial.println("⏳ WAIT_ANALYSIS auto-continue → NAVIGATE");
+        currentWaypoint++;
+        if (!hasMore) {
+            state = RETURN_HOME;
+        } else {
+            state = NAVIGATE;
+            stateEntryTime = millis();
+            sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
+        }
+        sendStatusToGS(state);
+        break;
+    }
+
+
+    // -------------------------------
+    // TIMEOUT MAYOR (por seguridad)
+    // -------------------------------
+    if (millis() - analysisStartTime > ANALYSIS_TIMEOUT) {
+        Serial.println("⌛ TIMEOUT análisis → NAVIGATE");
+        currentWaypoint++;
+        if (!hasMore) {
+            state = RETURN_HOME;
+        } else {
+            state = NAVIGATE;
+            stateEntryTime = millis();
+            sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
+        }
+        sendStatusToGS(state);
+    }
+
+    break;
+}
+
+
+        case RETURN_HOME:
+            lat_f += (mission.home.lat - lat_f) * 0.25;
+            lon_f += (mission.home.lon - lon_f) * 0.25;
+            alt_f  = max(alt_f - 0.05, 0.0);
+
+            if (haversineDistance(lat_f, lon_f, mission.home.lat, mission.home.lon) < 1.5) {
+                state = LAND;
+                sendStatusToGS(state);
+            }
+            break;
+
+        case LAND:
+            alt_f = max(alt_f - 0.15, 0.0);
+            if (alt_f <= 0.5) {
+                state = COMPLETE;
+                sendStatusToGS(state);
+            }
+            break;
+
+        case COMPLETE:
+            resetMissionState();
+            sendStatusToGS(state);
+            break;
+    }
 }
 
 // ============================================================================
