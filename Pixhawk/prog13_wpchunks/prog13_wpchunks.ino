@@ -111,7 +111,21 @@ unsigned long mav_last_update_ms = 0;
 float mav_batt_voltage = 0.0f;
 float mav_batt_current = 0.0f;
 int   mav_batt_remaining = -1;
-//------
+
+// Máximos ajustables RECEPCION WP CHUNKS
+static const int MAX_MISSION_CHUNKS = 64;
+
+String missionChunks[MAX_MISSION_CHUNKS];
+bool   missionChunkReceived[MAX_MISSION_CHUNKS];
+int    missionExpectedChunks = 0;
+int    missionTotalWPs = 0;
+
+bool   missionHasHeader = false;
+bool   missionReady = false;
+
+unsigned long missionLastChunkTime = 0;
+const unsigned long MISSION_TIMEOUT = 3000;   // 3s → timeout para chunk faltante
+
 // Traduce el custom_mode de ArduCopter a texto legible
 String decodeFlightMode(uint32_t m) {
     switch (m) {
@@ -154,7 +168,6 @@ int           maxRetries   = 4;
 unsigned long nextMsgCounter = 0;
 
 // =======================
-// =======================
 // 🧭 Máquina de estados
 // =======================
 enum DroneState {
@@ -182,6 +195,51 @@ bool statusDirty         = true;
 void resetMissionState();
 void sendStatusToGS(DroneState st);
 void simulateDroneMotion();
+
+void checkMissionChunkTimeout() {
+    if (!missionHasHeader || missionReady) return;
+
+    if (millis() - missionLastChunkTime > MISSION_TIMEOUT) {
+        for (int i = 0; i < missionExpectedChunks; i++) {
+            if (!missionChunkReceived[i]) {
+                Serial.printf("⛔ Falta chunk %d → solicitando reenvío\n", i);
+                // construir REQ_WP_CHUNK
+                StaticJsonDocument<128> doc;
+                doc["t"] = "REQ_WP_CHUNK";
+                JsonObject d = doc.createNestedObject("d");
+                d["i"] = i;
+
+                String payload;
+                serializeJson(doc, payload);
+                String frame = String(UAV_HDR) + payload + SFX;
+
+                LoRa.beginPacket();
+                LoRa.print(frame);
+                LoRa.endPacket();
+
+                // Reiniciar el reloj para volver a chequear luego
+                missionLastChunkTime = millis();
+                return;  // pedimos 1 por vez
+            }
+        }
+    }
+}
+
+void sendMissionError(const char* msg) {
+    StaticJsonDocument<128> doc;
+    doc["t"] = "MISSION_ERROR";
+    JsonObject d = doc.createNestedObject("d");
+    d["error"] = msg;
+
+    String p;
+    serializeJson(doc, p);
+    String frame = String(UAV_HDR) + p + SFX;
+
+    LoRa.beginPacket();
+    LoRa.print(frame);
+    LoRa.endPacket();
+}
+
 
 // ============================================================================
 // 📡 Enviar estado de la FSM a la Ground Station
@@ -350,47 +408,6 @@ double computeBearing(double la1, double lo1, double la2, double lo2) {
   return fmod((rad2deg(brng) + 360.0), 360.0);
 }
 
-// =====================================
-// ORDENAMIENTO ROBUSTO DEL POLÍGONO (CW)
-// =====================================
-std::vector<Coordinate> orderPolygonPoints(const std::vector<Coordinate>& pts)
-{
-    if (pts.size() < 3) return pts;
-
-    // Calcular centroide
-    double cx = 0, cy = 0;
-    for (auto& p : pts) {
-        cx += p.lat;
-        cy += p.lon;
-    }
-    cx /= pts.size();
-    cy /= pts.size();
-
-    // Orden CCW por ángulo polar
-    std::vector<Coordinate> ordered = pts;
-    std::sort(ordered.begin(), ordered.end(),
-        [&](const Coordinate& a, const Coordinate& b) {
-            return atan2(a.lon - cy, a.lat - cx) < atan2(b.lon - cy, b.lat - cx);
-        }
-    );
-
-    // Determinar orientación (área firmada)
-    double area = 0;
-    for (int i = 0; i < ordered.size(); i++) {
-        double x1 = ordered[i].lat, y1 = ordered[i].lon;
-        double x2 = ordered[(i + 1) % ordered.size()].lat, y2 = ordered[(i + 1) % ordered.size()].lon;
-        area += (x2 - x1) * (y2 - y1);
-    }
-
-    // Si CCW → invertir para obtener CW
-    if (area > 0) {
-        std::reverse(ordered.begin(), ordered.end());
-    }
-
-    return ordered;
-}
-
-
 // ============================================================================
 // 📡 ACKs LoRa – helpers
 // ============================================================================
@@ -484,26 +501,27 @@ void checkPendingAcks() {
 }
 
 void sendAckToGS(const String &id) {
-  if (id == "") {
-    Serial.println("⚠️ ACK sin ID");
-    return;
-  }
+    if (id == "") {
+        Serial.println("⚠️ ACK sin ID");
+        return;
+    }
 
-  StaticJsonDocument<128> doc;
-  doc["t"] = "ACK";
-  JsonObject d = doc.createNestedObject("d");
-  d["id"] = id;
-  doc["ts"] = millis();
+    StaticJsonDocument<128> doc;
+    doc["t"] = "ACK";
+    doc["id"] = id;        // 🔥 ID AL NIVEL SUPERIOR
+    doc["ts"] = millis();
 
-  String p;
-  serializeJson(doc, p);
-  String msg = String(UAV_HDR) + p + String(SFX);
+    String p;
+    serializeJson(doc, p);
 
-  LoRa.beginPacket();
-  LoRa.print(msg);
-  LoRa.endPacket();
+    String msg = String(UAV_HDR) + p + String(SFX);
 
-  //Serial.println("📤 [sendAckToGS] " + msg);
+    LoRa.beginPacket();
+    LoRa.print(msg);
+    LoRa.endPacket();
+
+    // Debug opcional
+    // Serial.println("📤 ACK → " + msg);
 }
 
 void sendJsonNoAckToGS(const JsonDocument &doc) {
@@ -639,9 +657,19 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
     // ACK desde GS
     // -------------------------------
     if (strcmp(type, "ACK") == 0) {
-      String id = "";
-      if (doc.containsKey("d")) id = doc["d"]["id"] | "";
-      if (id != "") handleAck(id);
+      // Preferimos ID toplevel
+      String id = String(msgId);
+
+      // Compatibilidad: si alguien envía {"t":"ACK","d":{"id":"..."}} también lo aceptamos
+      if (id == "" && doc.containsKey("d")) {
+        id = doc["d"]["id"] | "";
+      }
+
+      if (id != "") {
+        handleAck(id);
+      } else {
+        Serial.println("⚠️ ACK recibido sin ID");
+      }
       return;
     }
 
@@ -673,6 +701,7 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
     //request waypoints para comparar
     if (strcmp(type,"REQ_WP_DEBUG")==0) {
     sendWaypointsDebugToGS();
+    sendAckToGS(msgId); 
     }
 
 
@@ -682,6 +711,7 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
     if (strcmp(type, "ARM") == 0) {
 
       Serial.println("📡 GS → ARM solicitado");
+      sendAckToGS(msgId);
 
       // 1) Siempre GUIDED antes de armar (solo en modo real)
       if (!testMode) {
@@ -788,60 +818,184 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
     }
 
     // ==========================================================
-    // MISSION_COMPACT → ruta 
+    // MISSION_INFO → header de misión desde la GS
     // ==========================================================
-    if (strcmp(type, "MISSION_COMPACT") == 0) {
-      Serial.println("📦 RX MISSION_COMPACT");
+    if (strcmp(type, "MISSION_INFO") == 0) {
+        Serial.println("📦 RX MISSION_INFO");
+        missionLastChunkTime = millis();
 
-      JsonObject d = doc["d"];
-      if (d.isNull()) {
-        Serial.println("❌ Campo d faltante");
-        return;
-      }
-
-      mission.polygon.clear();
-
-      JsonArray p = d["p"];
-      if (!p.isNull()) {
-        for (JsonArray::iterator it = p.begin(); it != p.end(); ++it) {
-          JsonArray coord = (*it).as<JsonArray>();
-          if (coord.size() == 2) {
-            Coordinate pt;
-            pt.lat = coord[0];
-            pt.lon = coord[1];
-            mission.polygon.push_back(pt);
-          }
+        JsonObject d = doc["d"];
+        if (d.isNull()) {
+            Serial.println("❌ Campo d faltante en MISSION_INFO");
+            return;
         }
-      }
-      // ORDENAMIENTO ROBUSTO DEL POLÍGONO
-      mission.polygon = orderPolygonPoints(mission.polygon);
 
-      JsonArray h = d["h"];
-      if (!h.isNull() && h.size() == 2) {
-        mission.home.lat = h[0];
-        mission.home.lon = h[1];
-      }
+        // HOME
+        JsonArray h = d["home"];
+        if (!h.isNull() && h.size() == 2) {
+            mission.home.lat = h[0];
+            mission.home.lon = h[1];
+        }
 
-      mission.altitude     = d["a"] | 20.0;
-      mission.spacing      = d["s"] | 10.0;
-      mission.event_action = d["event_action"] | "NONE";
-      mission.detect_spacing = d["ds"] | 5.0;   // NUEVO CAMPO
-      mission.loaded       = true;
+        mission.altitude        = d["alt"]            | 20.0;
+        mission.spacing         = d["spacing"]        | 10.0;
+        mission.detect_spacing  = d["detect_spacing"] | 5.0;
+        mission.event_action    = d["event_action"]   | "NONE";
 
-      currentWaypoint = 0;
+        missionExpectedChunks   = d["chunks"]   | 0;
+        missionTotalWPs         = d["wp_total"] | 0;
 
-      generateMissionPath(mission);
-      sendAckToGS(msgId);
+        if (missionExpectedChunks <= 0 || missionExpectedChunks > MAX_MISSION_CHUNKS) {
+            Serial.println("❌ MISSION_INFO: chunks inválidos");
+            missionExpectedChunks = 0;
+            return;
+        }
 
-      
-      return;
+        // Reset buffers
+        for (int i = 0; i < MAX_MISSION_CHUNKS; i++) {
+            missionChunks[i] = "";
+            missionChunkReceived[i] = false;
+        }
+
+        missionHasHeader = true;
+        missionReady     = false;
+
+        Serial.printf("📦 Header misión: HOME=(%.7f, %.7f), alt=%.1f, chunks=%d, wp_total=%d\n",
+                      mission.home.lat, mission.home.lon, mission.altitude,
+                      missionExpectedChunks, missionTotalWPs);
+
+        sendAckToGS(msgId);
+        return;
     }
+    // ==========================================================
+    // MISSION_WP_CHUNK → fragmentos de waypoints desde la GS
+    // ==========================================================
+    if (strcmp(type, "MISSION_WP_CHUNK") == 0) {
+        JsonObject d = doc["d"];
+        if (d.isNull()) {
+            Serial.println("❌ Campo d faltante en MISSION_WP_CHUNK");
+            return;
+        }
+
+        if (!missionHasHeader) {
+            Serial.println("⚠️ Recibí MISSION_WP_CHUNK sin MISSION_INFO previo");
+            return;
+        }
+
+        int idx   = d["i"] | -1;
+        int total = d["n"] | -1;
+        const char* chunkStr = d["chunk"] | "";
+
+        if (idx < 0 || idx >= missionExpectedChunks) {
+            Serial.printf("⚠️ Chunk index fuera de rango: i=%d\n", idx);
+            return;
+        }
+
+        if (total != missionExpectedChunks) {
+            Serial.printf("⚠️ total chunks mismatch: header=%d, msg=%d\n",
+                          missionExpectedChunks, total);
+            return;
+        }
+
+        missionChunks[idx] = String(chunkStr);
+        missionChunkReceived[idx] = true;
+        missionLastChunkTime = millis();
+
+        Serial.printf("🧩 Chunk %d/%d recibido (len=%d)\n",
+                      idx + 1, missionExpectedChunks,
+                      missionChunks[idx].length());
+
+        sendAckToGS(msgId);
+
+        // -------------------------------------------------
+        // Chequear si YA ESTÁN TODOS LOS CHUNKS
+        // -------------------------------------------------
+        bool allReceived = true;
+        for (int i = 0; i < missionExpectedChunks; i++) {
+            if (!missionChunkReceived[i]) {
+                allReceived = false;
+                break;
+            }
+        }
+
+        if (!allReceived) {
+            return;  // esperar más
+        }
+
+        // -------------------------------------------------
+        // Concatenar en ORDEN todos los chunks
+        // -------------------------------------------------
+        Serial.println("🧷 Todos los chunks recibidos → reconstruyendo lista de WPs");
+
+        std::vector<Coordinate> wps;
+        wps.reserve(missionTotalWPs > 0 ? missionTotalWPs : 100);
+
+        for (int c = 0; c < missionExpectedChunks; c++) {
+            String &s = missionChunks[c];
+            if (s.length() == 0) continue;
+
+            // parsear "lat,lon;lat,lon;..."
+            char buffer[512];
+            s.toCharArray(buffer, sizeof(buffer));
+
+            char* token = strtok(buffer, ";");
+            while (token != nullptr) {
+                double lat, lon;
+                if (sscanf(token, "%lf,%lf", &lat, &lon) == 2) {
+                    Coordinate pt;
+                    pt.lat = lat;
+                    pt.lon = lon;
+                    wps.push_back(pt);
+                }
+                token = strtok(nullptr, ";");
+            }
+        }
+
+        Serial.printf("📌 Reconstruidos %d WPs para la misión\n", (int)wps.size());
+
+        // -------------------------------------------------
+        // DEBUG: imprimir cada WP reconstruido
+        // -------------------------------------------------
+        Serial.println("📋 Lista completa de WPs reconstruidos:");
+        for (int i = 0; i < wps.size(); i++) {
+            Serial.printf("   [%d] %.7f , %.7f\n",
+                          i, wps[i].lat, wps[i].lon);
+        }
+
+        // opcional: si wps.size() != missionTotalWPs, loguear advertencia
+        if (missionTotalWPs > 0 && (int)wps.size() != missionTotalWPs) {
+            Serial.printf("⚠️ Advertencia: esperados=%d, reconstruidos=%d\n",
+                          missionTotalWPs, (int)wps.size());
+        }
+
+        // -------------------------------------------------
+        // Asignar a pathPoints (la ruta REAL de vuelo)
+        // -------------------------------------------------
+        pathPoints.clear();
+        for (auto &pt : wps) {
+            pathPoints.push_back(pt);
+        }
+
+        currentWaypoint = 0;
+        mission.loaded  = true;
+        missionReady    = true;
+
+        Serial.printf("✅ Misión lista: %d WAYPOINTS en pathPoints\n",
+                      (int)pathPoints.size());
+
+        // Avisar a la GS (si querés)
+        sendMissionLoadedToGS(pathPoints.size());
+
+        return;
+    }
+
 
     // ==========================================================
     // START_FLIGHT → iniciar misión manualmente
     // ==========================================================
     if (strcmp(type, "START_FLIGHT") == 0) {
         Serial.println("🚁 START_FLIGHT recibido → PREPARAR DESPEGUE");
+        sendAckToGS(msgId);
 
         // 1) Verificar que la misión esté cargada
         if (!mission.loaded || pathPoints.empty()) {
@@ -914,6 +1068,24 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
 
   Serial.printf("⚠️ Tipo desconocido: %s\n", type);
 }
+
+void sendMissionLoadedToGS(int wpCount) {
+    StaticJsonDocument<128> doc;
+    doc["t"] = "MISSION_LOADED";
+    JsonObject d = doc.createNestedObject("d");
+    d["total_wp"] = wpCount;
+
+    String p;
+    serializeJson(doc, p);
+    String msg = String(UAV_HDR) + p + String(SFX);
+
+    LoRa.beginPacket();
+    LoRa.print(msg);
+    LoRa.endPacket();
+
+    Serial.printf("📨 MISSION_LOADED enviado (total_wp=%d)\n", wpCount);
+}
+
 // ============================================================================
 // 📡 TELEMETRÍA PERIÓDICA HACIA GS
 // ============================================================================
@@ -1368,286 +1540,6 @@ void readMavlink() {
 
     } // end parse
   }   // end while
-}
-
-// =======================================================================================
-// 🧭 GENERADOR LAWN MOWER: ROTACIÓN + SUBDIVISIÓN ds + TURNING POINTS + FILTRADO + SMOOTH
-// =======================================================================================
-void generateMissionPath(Mission& m) {
-
-    pathPoints.clear();
-
-    // 🔴 USAR SIEMPRE EL POLÍGONO ORDENADO
-    std::vector<Coordinate> orderedPoly = orderPolygonPoints(m.polygon);
-
-    if (orderedPoly.size() < 4) {
-        Serial.println("❌ ERROR: se requieren 4 vértices para lawnmower.");
-        return;
-    }
-
-    // ---------------------------------------
-    // CONFIGURACIÓN DEL ALGORITMO
-    // ---------------------------------------
-    double TURN_RADIUS = 2.0;
-    double MIN_WP_DIST = 1.5;
-    double ds = (m.detect_spacing < 1.0) ? 1.0 : m.detect_spacing;
-
-    const double R = 6378137.0;
-    double lat0 = deg2rad(m.home.lat);
-    double lon0 = deg2rad(m.home.lon);
-
-    auto toLocal = [&](double lat, double lon) {
-        double dLat = deg2rad(lat) - lat0;
-        double dLon = deg2rad(lon) - lon0;
-        double y = dLat * R;
-        double x = dLon * R * cos(lat0);
-        return std::pair<double,double>(x,y);
-    };
-
-    auto toGlobal = [&](double x, double y) {
-        Coordinate c;
-        c.lat = rad2deg(lat0 + (y / R));
-        c.lon = rad2deg(lon0 + (x / (R * cos(lat0))));
-        return c;
-    };
-
-    // 1) Polígono local USANDO orderedPoly
-    vector<std::pair<double,double>> poly;
-    for (auto &p : orderedPoly)
-        poly.push_back(toLocal(p.lat, p.lon));
-
-    int N = poly.size();
-
-    // ---------------------------------------
-    // 2) Hallar el lado más largo
-    // ---------------------------------------
-    int iLongest = 0;
-    double maxDist = -1;
-
-    for (int i = 0; i < N; i++) {
-        int j = (i + 1) % N;
-        double dx = poly[j].first  - poly[i].first;
-        double dy = poly[j].second - poly[i].second;
-        double d  = sqrt(dx*dx + dy*dy);
-        if (d > maxDist) {
-            maxDist = d;
-            iLongest = i;
-        }
-    }
-
-    int i0 = iLongest;
-    int i1 = (iLongest + 1) % N;
-
-    double dx = poly[i1].first  - poly[i0].first;
-    double dy = poly[i1].second - poly[i0].second;
-
-    double theta = atan2(dy, dx);
-
-    // ---------------------------------------
-    // 3) Rotaciones
-    // ---------------------------------------
-    auto rot = [&](double x, double y) {
-        return std::pair<double,double>(
-            x*cos(theta) + y*sin(theta),
-           -x*sin(theta) + y*cos(theta)
-        );
-    };
-
-    auto unrot = [&](double xr, double yr) {
-        return std::pair<double,double>(
-            xr*cos(theta) - yr*sin(theta),
-            xr*sin(theta) + yr*cos(theta)
-        );
-    };
-
-    // ---------------------------------------
-    // 4) Polígono rotado
-    // ---------------------------------------
-    vector<std::pair<double,double>> polyR;
-    for (auto &p : poly)
-        polyR.push_back(rot(p.first, p.second));
-
-    // ---------------------------------------
-    // 5) Límites verticales
-    // ---------------------------------------
-    double ymin =  1e9, ymax = -1e9;
-
-    for (auto &p : polyR) {
-        ymin = min(ymin, p.second);
-        ymax = max(ymax, p.second);
-    }
-
-    double spacing = max(2.0, m.spacing);
-    int numLines = (int)((ymax - ymin) / spacing) + 2;
-
-    // ---------------------------------------
-    // Función intersección línea horizontal con polígono
-    // ---------------------------------------
-    auto intersect = [&](double yL) {
-        vector<std::pair<double,double>> pts;
-        for (int i = 0; i < N; i++) {
-            int j = (i + 1) % N;
-
-            auto A = polyR[i];
-            auto B = polyR[j];
-
-            double yA = A.second;
-            double yB = B.second;
-
-            if ((yL >= yA && yL <= yB) || (yL >= yB && yL <= yA)) {
-                if (fabs(yB - yA) < 1e-6) continue;
-
-                double u = (yL - yA) / (yB - yA);
-                double x = A.first + (B.first - A.first) * u;
-                pts.push_back({x, yL});
-            }
-        }
-        return pts;
-    };
-
-    // ---------------------------------------
-    // 6) Generación de serpiente + turning points
-    // ---------------------------------------
-    bool reverse = false;
-    vector<std::pair<double,double>> raw;  // puntos ENU rotados
-
-    for (int k = 0; k < numLines; k++) {
-
-        double yL = ymin + k * spacing;
-        auto pts = intersect(yL);
-
-        if (pts.size() < 2) continue;
-
-        sort(pts.begin(), pts.end(), [](auto &a, auto &b){
-            return a.first < b.first;
-        });
-
-        auto A = pts.front();
-        auto B = pts.back();
-
-        if (reverse) std::swap(A, B);
-        reverse = !reverse;
-
-        // Longitud del tramo
-        double dxs = B.first - A.first;
-        double dys = B.second - A.second;
-        double segLen = sqrt(dxs*dxs + dys*dys);
-
-        if (segLen < 5.0) continue;
-
-        int n = max(1, (int)(segLen / ds));
-
-        // Subdivisión interna
-        for (int i = 0; i <= n; i++) {
-            double t = (double)i / n;
-            double xr = A.first  + dxs * t;
-            double yr = A.second + dys * t;
-            raw.push_back({xr, yr});
-        }
-
-        // Turning points (excepto última línea)
-        if (k + 1 < numLines) {
-            double xf = B.first;
-            double yf = B.second;
-
-            // B' → alejamos hacia afuera
-            double xB = xf + TURN_RADIUS * (dxs / segLen);
-            double yB = yf + TURN_RADIUS * (dys / segLen);
-            raw.push_back({xB, yB});
-        }
-    }
-
-    // ---------------------------------------
-    // 7) Un-rotate + to lat/lon
-    // ---------------------------------------
-    vector<Coordinate> wps;
-    for (auto &q : raw) {
-        auto p0 = unrot(q.first, q.second);
-        wps.push_back(toGlobal(p0.first, p0.second));
-    }
-
-    // ---------------------------------------
-    // 8) Filtrado de puntos cercanos
-    // ---------------------------------------
-    vector<Coordinate> filtered;
-    filtered.push_back(wps[0]);
-
-    for (int i = 1; i < wps.size(); i++) {
-        double d = haversineDistance(
-            filtered.back().lat, filtered.back().lon,
-            wps[i].lat, wps[i].lon
-        );
-        if (d > MIN_WP_DIST)
-            filtered.push_back(wps[i]);
-    }
-
-    // ---------------------------------------
-    // 9) Suavizado simple
-    // ---------------------------------------
-    for (int i = 1; i < filtered.size() - 1; i++) {
-        filtered[i].lat = 0.6 * filtered[i].lat +
-                          0.2 * filtered[i - 1].lat +
-                          0.2 * filtered[i + 1].lat;
-
-        filtered[i].lon = 0.6 * filtered[i].lon +
-                          0.2 * filtered[i - 1].lon +
-                          0.2 * filtered[i + 1].lon;
-    }
-
-    // ---------------------------------------
-    // 10) Elegir el punto más cercano a HOME
-    // ---------------------------------------
-    int bestIdx = 0;
-    double bestDist = 1e30;
-
-    for (int i = 0; i < filtered.size(); i++) {
-        double d = haversineDistance(
-            m.home.lat, m.home.lon,
-            filtered[i].lat, filtered[i].lon
-        );
-        if (d < bestDist) {
-            bestDist = d;
-            bestIdx = i;
-        }
-    }
-
-    // Rotamos la lista para empezar desde ahí
-    pathPoints.clear();
-    for (int i = 0; i < filtered.size(); i++) {
-        int idx = (bestIdx + i) % filtered.size();
-        pathPoints.push_back(filtered[idx]);
-    }
-
-    // ---------------------------------------
-    // 11) Enviar información a GS
-    // ---------------------------------------
-    notifyWaypointCountToGS();
-    sendActiveWaypointToGS(0, pathPoints[0]);
-
-    Serial.printf("🧭 %d WAYPOINTS GENERADOS (lawnmower+ds+turn)\n",
-                  (int)pathPoints.size());
-}
-
-
-void notifyWaypointCountToGS() {
-  StaticJsonDocument<128> doc;
-  doc["t"] = "WAYPOINTS_INFO";
-  doc["total"] = pathPoints.size();
-  doc["ts"] = millis();
-  if (!pathPoints.empty()) {
-      doc["wp0"]["lat"] = pathPoints[0].lat;
-      doc["wp0"]["lon"] = pathPoints[0].lon;}
-  
-  sendActiveWaypointToGS(0, pathPoints[0]);
-  String payload;
-  serializeJson(doc, payload);
-  String frame = String(UAV_HDR) + payload + String(SFX);
-
-  LoRa.beginPacket();
-  LoRa.print(frame);
-  LoRa.endPacket();
-
-  Serial.printf("📤 [GS] WAYPOINTS_INFO total=%d\n", pathPoints.size());
 }
 
 
@@ -2543,52 +2435,27 @@ void loop() {
 
     unsigned long now = millis();
 
-    // ============================================================
-    // 1) Procesar siempre PRIMERO LoRa (comandos de GS)
-    // ============================================================
-    handleLoRa();  // prioridad absoluta
+    handleLoRa(); 
 
-    // ============================================================
-    // 2) Ack handling (liviano)
-    // ============================================================
     checkPendingAcks();
 
-    // ============================================================
-    // 3) Leer MAVLink NO BLOQUEANTE (máx 25 bytes por ciclo)
-    // ============================================================
     readMavlink();
 
-    // ============================================================
-    // 4) RPi → eventos JSON
-    // ============================================================
     handleSerialRPI();
 
-    // ============================================================
-    // 5) FSM vuelo (estado high-level)
-    // ============================================================
     updateStateMachine();
 
-    // ============================================================
-    // 6) Heartbeat a Pixhawk (cada 1s)
-    // ============================================================
     if (now - lastHbMs > 1000) {
         sendHeartbeatToPixhawk();
         lastHbMs = now;
     }
 
-    // ============================================================
-    // 7) Telemetría a GS
-    // ============================================================
     handleTelemetry();
 
-    // ============================================================
-    // 8) Simulación (si está ON)
-    // ============================================================
+    checkMissionChunkTimeout();
+
     simulateDroneMotion();
 
-    // ============================================================
-    // 9) Servos
-    // ============================================================
     handleServoAction();
 }
 
