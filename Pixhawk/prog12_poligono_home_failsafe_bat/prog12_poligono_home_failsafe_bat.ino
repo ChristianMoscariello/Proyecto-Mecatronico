@@ -1334,6 +1334,13 @@ void readMavlink() {
         mavlink_sys_status_t sys;
         mavlink_msg_sys_status_decode(&msg, &sys);
 
+        Serial.printf(
+        "[SYS_STATUS RAW] volt_raw=%u mV  (%.5f V)  batt_remaining=%d %%\n",
+        sys.voltage_battery,
+        sys.voltage_battery / 1000.0f,
+        sys.battery_remaining
+        );
+
         // Voltaje bruto del mensaje (mV)
         if (sys.voltage_battery == UINT16_MAX || sys.voltage_battery == 0) {
             mav_batt_voltage = -1;   // sin información válida
@@ -2209,31 +2216,62 @@ void resetMissionState() {
 
 
 void requestMavlinkStreams() {
-  // Request GLOBAL_POSITION_INT (ID 33)
-  mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+    mavlink_message_t msg;
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+    uint16_t len;
 
-  mavlink_msg_request_data_stream_pack(
-      42, 199,           // sysid, compid (ESP32)
-      &msg,
-      1, 1,              // target system & component (Pixhawk)
-      MAV_DATA_STREAM_POSITION,
-      5,                // 5 Hz
-      1);                // start
+    // ============================================================
+    // 🛰 STREAM DE POSICIÓN (GLOBAL_POSITION_INT – MSG 33)
+    // ============================================================
+    mavlink_msg_request_data_stream_pack(
+        42, 199,           // sysid, compid (ESP32)
+        &msg,
+        1, 1,              // target system/component (Pixhawk)
+        MAV_DATA_STREAM_POSITION,
+        5,                 // 5 Hz
+        1                  // start
+    );
+    len = mavlink_msg_to_send_buffer(buf, &msg);
+    SerialMAV.write(buf, len);
 
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  SerialMAV.write(buf, len);
+    // ============================================================
+    // 🛰 STREAM EXTRA2 (VFR_HUD – MSG 74)
+    // ============================================================
+    mavlink_msg_request_data_stream_pack(
+        42, 199,
+        &msg,
+        1, 1,
+        MAV_DATA_STREAM_EXTRA2,
+        10,                // 10 Hz
+        1
+    );
+    len = mavlink_msg_to_send_buffer(buf, &msg);
+    SerialMAV.write(buf, len);
 
-  // Request EXTRA2 (contains VFR_HUD)
-  mavlink_msg_request_data_stream_pack(
-      42,199,&msg,
-      1,1,
-      MAV_DATA_STREAM_EXTRA2,
-      10,1);
+    // ============================================================
+    // 🔋 *** STREAM EXTENDED_STATUS (SYS_STATUS – MSG 1) ***
+    // ============================================================
+    // ESTE stream contiene:
+    //   - voltage_battery (mV)
+    //   - current_battery (cA)
+    //   - battery_remaining (%)
+    //   - load, drop rate, etc
+    // SIN esto → ¡NO HAY VOLTAJE NI %!
+    mavlink_msg_request_data_stream_pack(
+        42, 199,
+        &msg,
+        1, 1,
+        MAV_DATA_STREAM_EXTENDED_STATUS,   // << EL QUE TE FALTABA
+        2,                                 // 2 Hz suficiente
+        1
+    );
+    len = mavlink_msg_to_send_buffer(buf, &msg);
+    SerialMAV.write(buf, len);
 
-  len = mavlink_msg_to_send_buffer(buf,&msg);
-  SerialMAV.write(buf, len);
+    // Opcional: mensaje de debug
+    Serial.println("📡 Solicitud de streams MAVLink enviada (POS, EXTRA2, EXTENDED_STATUS)");
 }
+
 
 void sendWaypointsDebugToGS() {
     if (pathPoints.empty()) {
@@ -2317,7 +2355,7 @@ void setup() {
   actionServo.attach(SERVO_PIN);
   actionServo.write(SERVO_CLOSED);
   Serial.println("✅ Servo listo (cerrado)");
-  delay(500);
+  delay(6000);
   requestMavlinkStreams();
   delay(1500);
   Serial.println("🚀 Sistema iniciado");
