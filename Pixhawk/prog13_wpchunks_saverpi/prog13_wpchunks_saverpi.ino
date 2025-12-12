@@ -1037,39 +1037,42 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
   // 2) MENSAJES DESDE LA RPi (EVENTOS)
   // ------------------------------------------------------------------
   if (strcmp(type, "GO") == 0) {
-    analysisResult = GO;
-    Serial.println("📩 [RPI] GO");
-    return;
+          analysisResult = GO;
+          Serial.println("📩 [RPI] GO");
+          return;
+      }
+
+      if (strcmp(type, "FIRE") == 0) {
+
+          analysisResult = FIRE;
+
+          float conf = -1;
+          if (doc.containsKey("confidence")) 
+              conf = doc["confidence"];
+          else if (doc.containsKey("d") && doc["d"].containsKey("confidence"))
+              conf = doc["d"]["confidence"];
+
+          sendEventToGS("FIRE", mav_lat, mav_lon, mav_alt_rel, millis(), conf);
+          return;
+      }
+
+      if (strcmp(type, "PERSON") == 0) {
+
+          analysisResult = PERSON;
+
+          float conf = -1;
+          if (doc.containsKey("confidence")) 
+              conf = doc["confidence"];
+          else if (doc.containsKey("d") && doc["d"].containsKey("confidence"))
+              conf = doc["d"]["confidence"];
+
+          sendEventToGS("PERSON", mav_lat, mav_lon, mav_alt_rel, millis(), conf);
+          return;
+      }
+
+      Serial.printf("⚠️ Tipo desconocido: %s\n", type);
   }
 
-  if (strcmp(type, "FIRE") == 0) {
-    analysisResult = FIRE;
-
-    float confidence = -1;
-    if (doc.containsKey("confidence")) confidence = doc["confidence"];
-    else if (doc.containsKey("d") && doc["d"].containsKey("confidence"))
-      confidence = doc["d"]["confidence"];
-
-    sendEventToGS("FIRE", mav_lat, mav_lon, mav_alt_rel, millis(), confidence);
-    return;
-  }
-
-  if (strcmp(type, "PERSON") == 0) {
-    analysisResult = PERSON;
-    actionServo.write(SERVO_OPEN);
-
-    float confidence = -1;
-    if (doc.containsKey("confidence")) confidence = doc["confidence"];
-    else if (doc.containsKey("d") && doc["d"].containsKey("confidence"))
-      confidence = doc["d"]["confidence"];
-
-    sendEventToGS("PERSON", mav_lat, mav_lon, mav_alt_rel, millis(), confidence);
-
-    return;
-  }
-
-  Serial.printf("⚠️ Tipo desconocido: %s\n", type);
-}
 
 void sendMissionLoadedToGS(int wpCount) {
     StaticJsonDocument<128> doc;
@@ -1180,7 +1183,7 @@ void sendStableToRPi(const Coordinate &pos) {
   //doc["lat"] = mav_lat;
   //doc["lon"] = mav_lon;
   //doc["alt"] = mav_alt_rel;
-  //doc["ts"]  = millis();
+  doc["ts"]  = millis();
 
   String payload;
   serializeJson(doc, payload);
@@ -1936,56 +1939,68 @@ void updateStateMachine() {
 
     // -------------------------------------------------------------------------
     case WAIT_ANALYSIS: {
+        
+        // ✅ FIX 4: Verificar que analysisStartTime está inicializado
+        if (analysisStartTime == 0) {
+            Serial.println("⚠️ analysisStartTime era 0, reiniciando");
+            analysisStartTime = millis();
+        }
 
         bool hasMore = (currentWaypoint + 1 < (int)pathPoints.size());
-        unsigned long elapsed = millis() - analysisStartTime;
 
-        // ============================================================
-        // 1) PRIORIDADES MÁXIMAS
-        // ============================================================
-
-        // DISARM siempre primero
-        if (loraDisarmCommand) {
-            loraDisarmCommand = false;
-            if (!testMode) pixhawkArm(false);
-            resetMissionState();
-            break;
+        // 🐛 DEBUG: Status del análisis cada 1s
+        static unsigned long lastAnalysisDebug = 0;
+        if (millis() - lastAnalysisDebug > 1000) {
+            unsigned long elapsed = millis() - analysisStartTime;
+           // Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+           // Serial.printf("📷 WAIT_ANALYSIS (WP %d)\n", currentWaypoint);
+           // Serial.printf("   Tiempo: %lu/%lu ms\n", elapsed, ANALYSIS_TIMEOUT);
+           // Serial.printf("   Resultado: %s\n", 
+                         //analysisResult == NONE ? "NONE" :
+                         //analysisResult == GO ? "GO" :
+                        // analysisResult == FIRE ? "FIRE" : "PERSON");
+           // Serial.printf("   Next WP: %s\n", hasMore ? "YES" : "NO (last)");
+           // Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            lastAnalysisDebug = millis();
         }
 
-        // RETURN siempre segundo
-        if (loraReturnCommand) {
-            loraReturnCommand = false;
-            state = RETURN_HOME;
-            sendStatusToGS(state);
-            break;
-        }
-
-        // ============================================================
-        // 2) RESULTADOS DESDE LA RPi
-        // ============================================================
-
+        // Procesar resultado
         if (analysisResult != NONE) {
 
             if (analysisResult == GO) {
+                Serial.println("✅ RPi → GO");
                 currentWaypoint++;
-
+                
                 if (!hasMore) {
+                    Serial.println("   → Era el último WP → RETURN_HOME");
                     state = RETURN_HOME;
                 } else {
+                    Serial.printf("   → Siguiente WP %d: %.6f, %.6f\n",
+                                 currentWaypoint,
+                                 pathPoints[currentWaypoint].lat,
+                                 pathPoints[currentWaypoint].lon);
                     state = NAVIGATE;
                     sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
                 }
                 sendStatusToGS(state);
             }
-
             else if (analysisResult == FIRE || analysisResult == PERSON) {
+                
+                Serial.printf("🚨 RPi → %s\n", analysisResult == FIRE ? "FIRE" : "PERSON");
+                
+                if (analysisResult == PERSON) {
+                    Serial.println("   → Activando SERVO");
+                    triggerServoAction();
+                }
 
-                if (analysisResult == PERSON) triggerServoAction();
+                Serial.printf("   → Event action: %s\n", mission.event_action.c_str());
 
-                if (!hasMore || mission.event_action.equalsIgnoreCase("RETURN")) {
+                if (mission.event_action.equalsIgnoreCase("RETURN") || !hasMore) {
+                    Serial.println("   → RETURN_HOME");
                     state = RETURN_HOME;
                 } else {
                     currentWaypoint++;
+                    Serial.printf("   → CONTINUE → WP %d\n", currentWaypoint);
                     state = NAVIGATE;
                     sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
                 }
@@ -1996,17 +2011,41 @@ void updateStateMachine() {
             break;
         }
 
+        // ✅ FIX 5: Timeout mejorado con logs
+        unsigned long elapsed = millis() - analysisStartTime;
+        
+        if (elapsed > ANALYSIS_TIMEOUT) {
+            Serial.printf("⏱️ TIMEOUT análisis (%lu ms)\n", elapsed);
+            currentWaypoint++;
+            
+            if (!hasMore) {
+                Serial.println("   → Era el último WP → RETURN_HOME");
+                state = RETURN_HOME;
+            } else {
+                Serial.printf("   → TIMEOUT → WP %d: %.6f, %.6f\n",
+                             currentWaypoint,
+                             pathPoints[currentWaypoint].lat,
+                             pathPoints[currentWaypoint].lon);
+                state = NAVIGATE;
+                sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
+            }
+            sendStatusToGS(state);
+        }
+
+        break;
+    }
+
         // ============================================================
         // 3) EARLY AUTO-CONTINUE (para no frenar el dron innecesariamente)
         // ============================================================
 
-        /*if (elapsed > 2000 && hasMore) {   // << early continue
+        if (elapsed > 2000 && hasMore) {   // << early continue
             currentWaypoint++;
             state = NAVIGATE;
             sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
             sendStatusToGS(state);
             break;
-        }*/
+        }
 
         // ============================================================
         // 4) TIMEOUT PRINCIPAL (seguridad)
