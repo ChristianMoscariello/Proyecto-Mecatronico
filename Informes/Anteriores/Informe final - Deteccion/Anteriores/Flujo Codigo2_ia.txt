@@ -1,0 +1,32 @@
+flowchart TD
+
+%% ====== ESTILO DEL INICIO ======
+classDef inicio fill:#10334A,stroke:#000,stroke-width:2px,color:#FFF,font-size:22px;
+
+%% ====== OTROS ESTILOS ======
+classDef proceso fill:#CEE6F2,stroke:#79BAD9,stroke-width:2px,color:#000;
+classDef decision fill:#79BAD9,stroke:#0A6794,stroke-width:2px,color:#000,font-weight:bold;
+classDef salida fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#000;
+classDef loop fill:#ede7f6,stroke:#512da8,stroke-width:2px,color:#000;
+
+%% ====== NODOS PRINCIPALES ======
+A(("Inicio")):::inicio
+B["Configurar sistema<br>(carpetas, paths, clases)"]:::proceso
+C["Cargar modelo YOLOv8 ONNX"]:::proceso
+D["Iniciar vigilancia<br>(watchdog en carpeta)"]:::proceso
+E{"Nueva<br>imagen RGB"}:::decision
+F["Procesar imagen<br>con IA"]:::proceso
+G{"¿Detecciones?"}:::decision
+H["Enviar alerta<br>PERSON / FIRE"]:::salida
+I["Enviar GO"]:::salida
+J["Guardar imagen<br>analizada"]:::proceso
+K["Esperar nuevas imágenes"]:::loop
+
+%% ====== FLUJO ======
+A --> B --> C --> D --> E
+E -->|Sí| F --> G
+E -->|No| K
+
+G -->|Sí| H --> J --> K
+G -->|No| I --> J
+K --> E
