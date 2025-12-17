@@ -1,0 +1,85 @@
+<mxfile host="Electron" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/29.0.3 Chrome/140.0.7339.249 Electron/38.7.0 Safari/537.36" version="29.0.3">
+  <diagram name="Página-1" id="ZcZAiiMQW7mDkd8w-7uD">
+    <mxGraphModel dx="772" dy="509" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" background="none" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-1" value="" style="whiteSpace=wrap;html=1;aspect=fixed;align=center;" vertex="1" parent="1">
+          <mxGeometry x="290" y="100" width="500" height="500" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-4" value="ESP32" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="345" y="70" width="110" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0;entryY=0.25;entryDx=0;entryDy=0;" edge="1" parent="1" source="in1rGYb_KLgq3h8Mt-N6-5" target="in1rGYb_KLgq3h8Mt-N6-6">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="660" y="60" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" edge="1" parent="1" source="in1rGYb_KLgq3h8Mt-N6-5" target="in1rGYb_KLgq3h8Mt-N6-10">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-5" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;Comunicaciones&lt;/font&gt;&lt;div&gt;&lt;ul&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;LoRa Rx y Tx&lt;/font&gt;&lt;/li&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Framing Gs#, UAV#, #END&lt;/font&gt;&lt;/li&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Parser Json&lt;/font&gt;&lt;/li&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Gestion ACK&lt;/font&gt;&lt;/li&gt;&lt;/ul&gt;&lt;/div&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#cce5ff;strokeColor=#36393d;" vertex="1" parent="1">
+          <mxGeometry x="470" y="110" width="150" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.662;entryY=0.033;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="in1rGYb_KLgq3h8Mt-N6-6" target="in1rGYb_KLgq3h8Mt-N6-5">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="560" y="80" as="targetPoint" />
+            <Array as="points">
+              <mxPoint x="650" y="85" />
+              <mxPoint x="650" y="80" />
+              <mxPoint x="569" y="80" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-6" value="Estacion terrestre" style="whiteSpace=wrap;html=1;aspect=fixed;" vertex="1" parent="1">
+          <mxGeometry x="680" y="10" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-9" value="Rf LoRa" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="560" y="40" width="60" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-13" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="in1rGYb_KLgq3h8Mt-N6-10" target="in1rGYb_KLgq3h8Mt-N6-11">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-10" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;Gestion de misión&lt;/font&gt;&lt;div&gt;&lt;ul&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Recpción mission_info&lt;/font&gt;&lt;/li&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Recepcion mission_chunks&lt;/font&gt;&lt;/li&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Reconstruccion de mision recibida&lt;/font&gt;&lt;/li&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Vector pathpoints&lt;/font&gt;&lt;/li&gt;&lt;/ul&gt;&lt;/div&gt;" style="whiteSpace=wrap;html=1;aspect=fixed;fillColor=#eeeeee;strokeColor=#36393d;" vertex="1" parent="1">
+          <mxGeometry x="605" y="230" width="140" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-17" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.75;exitDx=0;exitDy=0;entryX=0.25;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="in1rGYb_KLgq3h8Mt-N6-11" target="in1rGYb_KLgq3h8Mt-N6-14">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-27" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=1;exitDx=0;exitDy=0;entryX=1;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="in1rGYb_KLgq3h8Mt-N6-11" target="in1rGYb_KLgq3h8Mt-N6-26">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-11" value="&lt;div&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Máquina de Estados (FSM)&amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp; &amp;nbsp;&amp;nbsp;&lt;span style=&quot;background-color: transparent; color: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));&quot;&gt;&amp;nbsp;&lt;/span&gt;&lt;/font&gt;&lt;/div&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffff88;strokeColor=#36393d;" vertex="1" parent="1">
+          <mxGeometry x="610" y="410" width="130" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.25;entryDx=0;entryDy=0;" edge="1" parent="1" source="in1rGYb_KLgq3h8Mt-N6-14" target="in1rGYb_KLgq3h8Mt-N6-11">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-19" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.25;exitDx=0;exitDy=0;entryX=0.75;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="in1rGYb_KLgq3h8Mt-N6-14" target="in1rGYb_KLgq3h8Mt-N6-18">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-14" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;MAVlink - Pixhawk&lt;/font&gt;&lt;div&gt;&lt;ul&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Telemetria y bateria&lt;/font&gt;&lt;/li&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Estado&lt;/font&gt;&lt;/li&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;GOTO&lt;/font&gt;&lt;/li&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Takeoff/land&lt;/font&gt;&lt;/li&gt;&lt;/ul&gt;&lt;/div&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffcccc;strokeColor=#36393d;" vertex="1" parent="1">
+          <mxGeometry x="440" y="260" width="140" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-18" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;Filtro GPS y sensores&lt;/font&gt;&lt;div&gt;&lt;ul&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Media movil&lt;/font&gt;&lt;/li&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Rechazo de saltos&lt;/font&gt;&lt;/li&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;warmup&lt;/font&gt;&lt;/li&gt;&lt;/ul&gt;&lt;/div&gt;" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="310" y="140" width="126" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-22" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.75;exitDx=0;exitDy=0;entryX=-0.004;entryY=0.882;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="in1rGYb_KLgq3h8Mt-N6-18" target="in1rGYb_KLgq3h8Mt-N6-5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-23" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;Analisis Raspberry&lt;/font&gt;&lt;div&gt;&lt;ul&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;STABLE - captura imagen&lt;/font&gt;&lt;/li&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Resultado GO/PERSON/FIRE&lt;/font&gt;&lt;/li&gt;&lt;/ul&gt;&lt;/div&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#cdeb8b;strokeColor=#36393d;" vertex="1" parent="1">
+          <mxGeometry x="570" y="490" width="170" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-24" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.443;entryY=0.056;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="in1rGYb_KLgq3h8Mt-N6-11" target="in1rGYb_KLgq3h8Mt-N6-23">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-25" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.75;exitY=0;exitDx=0;exitDy=0;entryX=0.677;entryY=1;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="in1rGYb_KLgq3h8Mt-N6-23" target="in1rGYb_KLgq3h8Mt-N6-11">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="in1rGYb_KLgq3h8Mt-N6-26" value="&lt;font style=&quot;font-size: 10px;&quot;&gt;Servo gripper&lt;/font&gt;&lt;div&gt;&lt;ul&gt;&lt;li&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;open/close&lt;/font&gt;&lt;/li&gt;&lt;/ul&gt;&lt;/div&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffcc99;strokeColor=#36393d;" vertex="1" parent="1">
+          <mxGeometry x="440" y="480" width="106" height="50" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

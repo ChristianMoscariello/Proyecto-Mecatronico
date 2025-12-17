@@ -1056,6 +1056,7 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
 
   if (strcmp(type, "PERSON") == 0) {
     analysisResult = PERSON;
+    actionServo.write(SERVO_OPEN);
 
     float confidence = -1;
     if (doc.containsKey("confidence")) confidence = doc["confidence"];
@@ -1063,6 +1064,7 @@ void processIncomingJSON(const String &jsonIn, bool fromGS) {
       confidence = doc["d"]["confidence"];
 
     sendEventToGS("PERSON", mav_lat, mav_lon, mav_alt_rel, millis(), confidence);
+
     return;
   }
 
@@ -1175,10 +1177,10 @@ void handleSerialRPI() {
 void sendStableToRPi(const Coordinate &pos) {
   StaticJsonDocument<128> doc;
   doc["t"]   = "STABLE";
-  doc["lat"] = mav_lat;
-  doc["lon"] = mav_lon;
-  doc["alt"] = mav_alt_rel;
-  doc["ts"]  = millis();
+  //doc["lat"] = mav_lat;
+  //doc["lon"] = mav_lon;
+  //doc["alt"] = mav_alt_rel;
+  //doc["ts"]  = millis();
 
   String payload;
   serializeJson(doc, payload);
@@ -1998,13 +2000,13 @@ void updateStateMachine() {
         // 3) EARLY AUTO-CONTINUE (para no frenar el dron innecesariamente)
         // ============================================================
 
-        if (elapsed > 2000 && hasMore) {   // << early continue
+        /*if (elapsed > 2000 && hasMore) {   // << early continue
             currentWaypoint++;
             state = NAVIGATE;
             sendActiveWaypointToGS(currentWaypoint, pathPoints[currentWaypoint]);
             sendStatusToGS(state);
             break;
-        }
+        }*/
 
         // ============================================================
         // 4) TIMEOUT PRINCIPAL (seguridad)
