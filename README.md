@@ -3,7 +3,7 @@
 
 # Universidad Nacional de Lomas de Zamora – Facultad de Ingeniería
 
-## Desarrollo de un dron multirrotor con detección térmica e inteligencia artificial embarcada
+## Desarrollo de un dron multirrotor con inteligencia artificial embarcada para deteccion de personas y focos de incendio con cámara RGB y sensor térmico
 
 ---
 
@@ -146,7 +146,12 @@ Diagrama en bloques estación terrestre
 En esta sección se incluyen imágenes y videos correspondientes al desarrollo y funcionamiento del proyecto:
 
 - Fotografías del dron ensamblado
-![fotodron](https://github.com/user-attachments/assets/a164897e-e2ee-4c76-80c5-f3f553245354)
+<img width="1024" height="904" alt="image" src="https://github.com/user-attachments/assets/a8657a35-e360-4dae-ade2-f4d51a0e8704" />
+
+![unnamed](https://github.com/user-attachments/assets/8a98eca7-2521-4448-ba03-924da392385c)
+
+![unnamed](https://github.com/user-attachments/assets/68b30a2c-a352-481c-aaf6-86b9a14eda43)
+
 ![fotodron2](https://github.com/user-attachments/assets/c883afca-a525-49fd-9a1c-a87418a6c9f4)
 
 - Imágenes de pruebas de vuelo
@@ -175,11 +180,11 @@ La estructura del repositorio es la siguiente:
 - **Codigos camara:** Codigo utilizado para la camara RGB en Rapsberry Pi.
 - **Entrenamiento IA:** Imagenes utilizada para entrenar la inteligencia artificial.
 - **Esquemas electricos:** Esquemas de los componentes utilizados.
-- **Estacion terrestre:** Versiones de la aplicacion de la estacion terrestre, codigo fuente a ejecutar en Jupyter
-- **Funcionando para final - comportameinto full:** Programas definitivos con el comportamiento correcto
+- **Estacion terrestre:** Versiones de la aplicacion de la estacion terrestre, codigo fuente a ejecutar en Jupyter.
+- **Funcionando para final - comportameinto full:** Programas definitivos con el comportamiento correcto.
 - **Funcionando para regularidad:** Programas con vuelo lineal a un punto.
 - **Hojas de datos:** Hojas de datos de los componentes utilizados.
-- **Informes:** Documentación técnica, informes, cronogramas y material académico relacionado.
+- **Informes:** Documentación técnica, informes, cronogramas y material académico relacionado - leer informe e informe complementario.
 - **Modelado 3D:** Archivos editables en SolidWorks con el ensamble y piezas del dron.  
 - **Pixhawk:** Código fuente del sistema para ESP32.
 - **Videos demostracion funcionamiento:** Imágenes y videos del desarrollo y pruebas, videos de misiones.  
@@ -195,6 +200,8 @@ Este proyecto fue realizado por
 fmalenotti.ignacio@gmail.com
 
 **Moscariello, Christian**
+chris_mosca7@hotmail.com
 
 **Yacono, Emiliano**
+emilianoyacono@gmail.com
 
