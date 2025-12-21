@@ -145,10 +145,23 @@ Diagrama en bloques estación terrestre
 
 En esta sección se incluyen imágenes y videos correspondientes al desarrollo y funcionamiento del proyecto:
 
-- Fotografías del dron ensamblado  
-- Imágenes de pruebas de vuelo  
-- Capturas de la Ground Station en funcionamiento  
-- Videos demostrativos de detección de eventos  
+- Fotografías del dron ensamblado
+![fotodron](https://github.com/user-attachments/assets/a164897e-e2ee-4c76-80c5-f3f553245354)
+![fotodron2](https://github.com/user-attachments/assets/c883afca-a525-49fd-9a1c-a87418a6c9f4)
+
+- Imágenes de pruebas de vuelo
+
+![fotodronvual](https://github.com/user-attachments/assets/abc35068-0f46-405b-ba17-c0758f8c25f5) 
+
+![fotodronvula2](https://github.com/user-attachments/assets/5be659af-1ceb-44fd-9c06-fdbe451f45b8) 
+
+![fotodronvuela3](https://github.com/user-attachments/assets/a3cfb635-f6cd-4c4a-8d10-be3fab45d41a)
+
+### Demostracion del funcionamiento
+
+Seteo de la mision desde la estacion terrestre, verificacion de envios de datos, vuelo, analisis con resultado negativo y positivo (con imagenes capatadas por camara RGB e infrarroja)
+
+https://drive.google.com/file/d/1TM3VKN3AdO6jCpZxc90w7RzOZnjS9KI7/view?usp=sharing
 
 
 ---
