@@ -118,23 +118,28 @@ Para el adaptador USB - LoRa de la base:
 - Microcontrolador ESP32
 - Módulo LoRa SX1278
 
-
 ---
 
 ## Esquemáticos
 
 A continuación se presentan los esquemáticos y diagramas de diseño del sistema:
 
-![Esquema del dron](Esquemas electricos/drone.png)
-![Diagrama en bloques ESP32 dron] (Pixhawk/Diagrama dron.png)
+Esquema eléctrico del dron:
+<img width="1500" height="1294" alt="drone" src="https://github.com/user-attachments/assets/3bdfdade-fc21-4515-a349-c243c89ee564" />
 
-![Esquema del adaptador UBS-LoRa](Esquemas electricos/puente.png) 
-![Diagrama en bloques adaptador USB_LoRa] (Adaptador UART-LoRa/Diagrama puente.png)
-
-![Diagrama en bloques estacion terrestre](Estacion terrestre/Diagrama gs.png)
+Diagrama en bloques del dron
+<img width="621" height="591" alt="Diagrama dron" src="https://github.com/user-attachments/assets/df147e7a-9910-42de-9930-1a5c5da330a5" />
 
 
----
+Esquema eléctrico del adaptador USB-LoRa
+<img width="3000" height="1538" alt="puente" src="https://github.com/user-attachments/assets/2921aa3f-d824-4e71-82c9-43b7cd03e9c6" />
+
+Diagrama en bloques del adaptador USB-LoRa
+<img width="601" height="119" alt="Diagrama puente" src="https://github.com/user-attachments/assets/22a31898-7867-4687-9d21-f5d02fd17a3a" />
+
+Diagrama en bloques estación terrestre
+<img width="911" height="611" alt="Diagrama gs" src="https://github.com/user-attachments/assets/c3de5048-7896-4fe7-91da-cc73f6903a75" />
+
 
 ## Fotos / Videos
 
@@ -145,13 +150,6 @@ En esta sección se incluyen imágenes y videos correspondientes al desarrollo y
 - Capturas de la Ground Station en funcionamiento  
 - Videos demostrativos de detección de eventos  
 
-(Los archivos multimedia se encuentran disponibles en la carpeta **MULTIMEDIA**).
-
----
-
-## Autor
-
-Este proyecto fue realizado por **Ignacio Fernández Malenotti** como parte de la carrera de **Ingeniería Mecatrónica** en la Facultad de Ingeniería de la Universidad Nacional de Lomas de Zamora.
 
 ---
 
@@ -159,9 +157,31 @@ Este proyecto fue realizado por **Ignacio Fernández Malenotti** como parte de l
 
 La estructura del repositorio es la siguiente:
 
-- **CODIGO:** Código fuente del sistema (ESP32, Raspberry Pi y Ground Station).  
-- **MULTIMEDIA:** Imágenes y videos del desarrollo y pruebas.  
-- **PLANOS:** Esquemáticos, diagramas y vistas de diseño.  
-- **DATASHEET:** Hojas de datos de los componentes utilizados.  
-- **INFORMES:** Documentación técnica, informes, cronogramas y material académico relacionado.
+- **Adaptador USB-LoRa:** Codigo del adapatador para ESP32.
+- **Camara termografica:** Codigo utilizado en el M5stick y Raspberry Pi.
+- **Codigos camara:** Codigo utilizado para la camara RGB en Rapsberry Pi.
+- **Entrenamiento IA:** Imagenes utilizada para entrenar la inteligencia artificial.
+- **Esquemas electricos:** Esquemas de los componentes utilizados.
+- **Estacion terrestre:** Versiones de la aplicacion de la estacion terrestre, codigo fuente a ejecutar en Jupyter
+- **Funcionando para final - comportameinto full:** Programas definitivos con el comportamiento correcto
+- **Funcionando para regularidad:** Programas con vuelo lineal a un punto.
+- **Hojas de datos:** Hojas de datos de los componentes utilizados.
+- **Informes:** Documentación técnica, informes, cronogramas y material académico relacionado.
+- **Modelado 3D:** Archivos editables en SolidWorks con el ensamble y piezas del dron.  
+- **Pixhawk:** Código fuente del sistema para ESP32.
+- **Videos demostracion funcionamiento:** Imágenes y videos del desarrollo y pruebas, videos de misiones.  
+
+
+---
+
+## Autores
+
+Este proyecto fue realizado por 
+
+**Fernández Malenotti, Ignacio** 
+fmalenotti.ignacio@gmail.com
+
+**Moscariello, Christian**
+
+**Yacono, Emiliano**
 
