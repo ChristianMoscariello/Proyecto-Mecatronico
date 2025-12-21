@@ -92,7 +92,7 @@ Este proyecto fue desarrollado utilizando las siguientes tecnologías:
 
 ### Inteligencia Artificial
 - Redes neuronales convolucionales
-- YOLOv8 para detección de personas, fuego y humo
+- YOLOv8 para detección de personas y fuego
 - Procesamiento de visión por computadora
 
 ---
@@ -124,21 +124,32 @@ Para el adaptador USB - LoRa de la base:
 
 A continuación se presentan los esquemáticos y diagramas de diseño del sistema:
 
+
 Esquema eléctrico del dron:
+
 <img width="1500" height="1294" alt="drone" src="https://github.com/user-attachments/assets/3bdfdade-fc21-4515-a349-c243c89ee564" />
 
-Diagrama en bloques del dron
+
+Diagrama en bloques del dron:
+
 <img width="621" height="591" alt="Diagrama dron" src="https://github.com/user-attachments/assets/df147e7a-9910-42de-9930-1a5c5da330a5" />
 
 
-Esquema eléctrico del adaptador USB-LoRa
+
+Esquema eléctrico del adaptador USB-LoRa:
+
 <img width="3000" height="1538" alt="puente" src="https://github.com/user-attachments/assets/2921aa3f-d824-4e71-82c9-43b7cd03e9c6" />
 
-Diagrama en bloques del adaptador USB-LoRa
+
+Diagrama en bloques del adaptador USB-LoRa:
+
 <img width="601" height="119" alt="Diagrama puente" src="https://github.com/user-attachments/assets/22a31898-7867-4687-9d21-f5d02fd17a3a" />
 
-Diagrama en bloques estación terrestre
+
+Diagrama en bloques estación terrestre:
+
 <img width="911" height="611" alt="Diagrama gs" src="https://github.com/user-attachments/assets/c3de5048-7896-4fe7-91da-cc73f6903a75" />
+
 
 
 ## Fotos / Videos
@@ -148,9 +159,9 @@ En esta sección se incluyen imágenes y videos correspondientes al desarrollo y
 - Fotografías del dron ensamblado
 <img width="1024" height="904" alt="image" src="https://github.com/user-attachments/assets/a8657a35-e360-4dae-ade2-f4d51a0e8704" />
 
-![unnamed](https://github.com/user-attachments/assets/8a98eca7-2521-4448-ba03-924da392385c)
-
 ![unnamed](https://github.com/user-attachments/assets/68b30a2c-a352-481c-aaf6-86b9a14eda43)
+
+<img width="660" height="505" alt="image" src="https://github.com/user-attachments/assets/7c16c9e5-efe4-45b6-a1ef-21b08dac71e8" />
 
 ![fotodron2](https://github.com/user-attachments/assets/c883afca-a525-49fd-9a1c-a87418a6c9f4)
 
@@ -166,7 +177,7 @@ En esta sección se incluyen imágenes y videos correspondientes al desarrollo y
 
 Seteo de la mision desde la estacion terrestre, verificacion de envios de datos, vuelo, analisis con resultado negativo y positivo (con imagenes capatadas por camara RGB e infrarroja)
 
-https://drive.google.com/file/d/1TM3VKN3AdO6jCpZxc90w7RzOZnjS9KI7/view?usp=sharing
+https://drive.google.com/file/d/1ojA_1EPUBh213Cx6VwPE2h_yf2Y8xk58/view?usp=drive_link
 
 
 ---
