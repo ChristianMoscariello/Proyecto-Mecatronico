@@ -179,6 +179,8 @@ Seteo de la mision desde la estacion terrestre, verificacion de envios de datos,
 
 https://drive.google.com/file/d/1ojA_1EPUBh213Cx6VwPE2h_yf2Y8xk58/view?usp=drive_link
 
+https://youtu.be/2DbrhcWoiKQ
+
 
 ---
 
