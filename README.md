@@ -197,7 +197,7 @@ La estructura del repositorio es la siguiente:
 - **Funcionando para final - comportameinto full:** Programas definitivos con el comportamiento correcto.
 - **Funcionando para regularidad:** Programas con vuelo lineal a un punto.
 - **Hojas de datos:** Hojas de datos de los componentes utilizados.
-- **Informes:** Documentación técnica, informes, cronogramas y material académico relacionado - leer informe e informe complementario.
+- **Informes:** Documentación técnica, informes, presentacion, cronogramas y material académico relacionado - leer informe e informe complementario.
 - **Modelado 3D:** Archivos editables en SolidWorks con el ensamble y piezas del dron.  
 - **Pixhawk:** Código fuente del sistema para ESP32.
 - **Videos demostracion funcionamiento:** Imágenes y videos del desarrollo y pruebas, videos de misiones.  
